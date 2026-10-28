@@ -22,6 +22,5 @@ compile_error!("Select only one firmware board feature");
 
 mod app;
 mod board;
-mod memory;
 mod modules;
 mod platform;

@@ -10,7 +10,10 @@ pub async fn serve<S>(stack: embassy_net::Stack<'_>, context: &AppContext<S>) ->
 where
     S: crate::platform::storage::Storage,
 {
-    if !context.with_config(|config| config.wifi().telnet()).await {
+    if !context
+        .with_config(|config| config.extension().wifi().telnet())
+        .await
+    {
         core::future::pending::<()>().await;
     }
 

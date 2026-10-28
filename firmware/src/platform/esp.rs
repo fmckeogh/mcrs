@@ -14,7 +14,7 @@ use esp_bootloader_esp_idf::{
     partitions::{AppPartitionSubType, PartitionType},
 };
 use esp_hal::{clock::CpuClock, peripherals::Peripherals, rtc_cntl::Rtc, time::Instant};
-use esp_println::{print, println};
+use esp_println::println;
 
 use esp_backtrace as _;
 
@@ -50,12 +50,46 @@ pub struct Platform {
     pub peripherals: Peripherals,
 }
 
+/// The services the repeater uses from this platform.
+struct EspRepeaterPlatform;
+
+impl mcrs_repeater::platform::Platform for EspRepeaterPlatform {
+    fn now_millis(&self) -> u64 {
+        now_millis()
+    }
+
+    fn now_seconds(&self) -> u32 {
+        now_seconds()
+    }
+
+    fn set_wall_clock_if_forward(&self, unix_seconds: u32) -> bool {
+        set_wall_clock_if_forward(unix_seconds)
+    }
+
+    fn random_u32(&self) -> u32 {
+        random_u32()
+    }
+
+    fn reboot(&self) -> ! {
+        reboot()
+    }
+
+    fn firmware_version(&self) -> &'static str {
+        concat!("MCRS ", env!("MESHCORE_FIRMWARE_VERSION"))
+    }
+
+    fn log(&self, args: fmt::Arguments<'_>) {
+        log_fmt(args);
+    }
+}
+
 pub fn init() -> Platform {
     init_heap();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
     init_rtc_clock();
+    mcrs_repeater::platform::install(&EspRepeaterPlatform);
 
     log_starting();
 
@@ -828,14 +862,6 @@ fn retained_wall_clock_checksum(unix_seconds: u32, rtc_seconds: u32) -> u32 {
         ^ WALL_CLOCK_RTC_CHECK
 }
 
-pub fn battery_level_percent() -> Option<u8> {
-    None
-}
-
-pub fn battery_millivolts() -> Option<u16> {
-    None
-}
-
 fn init_heap() {
     esp_alloc::heap_allocator!(size: HEAP_SIZE);
 }
@@ -850,28 +876,6 @@ pub fn log_starting() {
 
 pub fn log_fmt(args: fmt::Arguments<'_>) {
     println!("{}", args);
-}
-
-pub fn log_hex_line(label: &str, bytes: &[u8], max_len: usize) {
-    print!("{}", label);
-    for byte in bytes.iter().take(max_len) {
-        print!(" {:02x}", byte);
-    }
-    if bytes.len() > max_len {
-        print!(" ...");
-    }
-    println!();
-}
-
-pub fn log_i8_line(label: &str, values: &[i8], max_len: usize) {
-    print!("{}", label);
-    for value in values.iter().take(max_len) {
-        print!(" {}", value);
-    }
-    if values.len() > max_len {
-        print!(" ...");
-    }
-    println!();
 }
 
 pub fn log_radio_spi_config_failed() {
@@ -901,19 +905,6 @@ pub fn log_radio_initialized() {
 
 pub fn log_radio_init_failed() {
     println!("Failed to initialize SX1262");
-}
-
-pub fn log_radio_packet_received(len: usize, rssi: i16, snr_quarters: i16, _payload: &[u8]) {
-    println!(
-        "SX1262 received packet: {} bytes, RSSI {}, SNR {}",
-        len,
-        rssi,
-        mcrs_firmware::radio_metrics::SnrDb(snr_quarters)
-    );
-}
-
-pub fn log_radio_receive_failed() {
-    println!("SX1262 receive failed");
 }
 
 pub fn log_radio_receive_error(stage: &str, error: &str) {

@@ -1,19 +1,9 @@
 //! Signal units at the SX126x boundary: RSSI in dBm, SNR in quarter-dB.
 use alloc::rc::Rc;
-use core::{cell::Cell, fmt};
+use core::cell::Cell;
 use embedded_hal_async::spi::{ErrorType, Operation, SpiDevice};
 
-/// Format quarter-dB as a decimal dB value without floating point or allocation.
-pub struct SnrDb(pub i16);
-impl fmt::Display for SnrDb {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let magnitude = self.0.unsigned_abs();
-        if self.0 < 0 {
-            f.write_str("-")?;
-        }
-        write!(f, "{}.{:02}", magnitude / 4, (magnitude % 4) * 25)
-    }
-}
+pub use mcrs_repeater::radio::SnrDb;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketMetrics {
@@ -85,7 +75,6 @@ impl<SPI: SpiDevice<u8>> SpiDevice<u8> for StatusSpi<SPI> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::format;
 
     use core::{
         future::Future,
@@ -259,21 +248,5 @@ mod tests {
         }
         assert_eq!(PacketMetrics::from_status(&[186, 0, 0]).rssi_dbm, -93);
         assert_eq!(PacketMetrics::from_status(&[188, 0, 0]).rssi_dbm, -94);
-    }
-
-    #[test]
-    fn displays_db_including_negative_fractional_values() {
-        for (quarters, expected) in [
-            (32, "8.00"),
-            (33, "8.25"),
-            (34, "8.50"),
-            (35, "8.75"),
-            (-1, "-0.25"),
-            (-33, "-8.25"),
-            (0, "0.00"),
-            (i16::MIN, "-8192.00"),
-        ] {
-            assert_eq!(format!("{}", SnrDb(quarters)), expected);
-        }
     }
 }

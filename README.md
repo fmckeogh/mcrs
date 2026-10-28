@@ -42,7 +42,7 @@ MCRS supports the following features:
 * Optional MQTT packet reporting to up to three brokers over Wi-Fi. This is only
   present in firmware compiled with the Cargo feature `mqtt`.
 
-Note: The storage format is different to the official MeshCore firmware, so a repeater that is switched to this firmware will come up with a fresh configuration and will need to be reconfigured. The default admin password is `meshcore`. 
+Note: The storage format is different to the official MeshCore firmware, so a repeater that is switched to this firmware will come up with a fresh configuration and will need to be reconfigured. The default admin password is `meshcore`.
 
 Note: MCRS currently defaults to the UK frequency 869.618MHz at 62.5KHz BW, SF8, CR6. Overriding this at build-time is still to be done.
 
@@ -55,6 +55,12 @@ Codex helped to write some, but not all, of this code. Special thanks to the htt
 * Heltec WSL3: Untested.
 
 ### Building
+
+The workspace has three crates:
+
+* `protocol`: MeshCore protocol types, packet encoder/decoder.
+* `repeater`: the board-independent repeater logic, including forwarding, configuration, the CLI and remote management.
+* `firmware`: board support, Wi-Fi, NTP, telnet, OTA updates and MQTT reporting.
 
 For Heltec, install the ESP Rust toolchain:
 
@@ -76,6 +82,7 @@ Useful build commands for e.g. the Heltec v3:
 
 ```sh
 cargo test -p mcrs-protocol
+cargo test -p mcrs-repeater
 cargo test -p mcrs-firmware --lib --features mqtt
 cargo +esp check-heltec-v3
 cargo +esp check-heltec-v3-mqtt
@@ -231,8 +238,8 @@ cargo +nightly fuzz run protocol_payloads
 The firmware has some opinionated defaults when compared to the official repeater firmware:
 
 * Flood adverts are not sent automatically and cannot be configured to do so. Flooded adverts
-  are extremely wasteful and take up a lot of airtime across long distances, so should be 
-  avoided wherever possible. 
+  are extremely wasteful and take up a lot of airtime across long distances, so should be
+  avoided wherever possible.
 * Zero-hop adverts are sent every 4 hours to populate neighbour lists, this is not currently
   configurable. It is useful to know about repeaters nearby and to be able to see neighbours
   in repeater telemetry, but we avoid sending information about them too often.

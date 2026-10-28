@@ -55,8 +55,8 @@ const BATTERY_ADC_SAMPLES: u32 = 8;
 const BATTERY_DIVIDER_SCALE_MILLI: u32 = 5420;
 const BATTERY_PERCENT_MIN_MV: u16 = 3300;
 const BATTERY_PERCENT_MAX_MV: u16 = 4100;
-pub(crate) const MEMORY_PROFILE: crate::memory::MemoryProfile =
-    crate::memory::MemoryProfile::new(160 * 1024, 8, 16, 64, 256);
+pub(crate) const MEMORY_PROFILE: mcrs_repeater::memory::MemoryProfile =
+    mcrs_repeater::memory::MemoryProfile::new(160 * 1024, 8, 16, 64, 256);
 pub(crate) const STORAGE_LAYOUT: crate::platform::storage::Layout =
     crate::platform::storage::Layout {
         partition_label: "meshcore",
@@ -442,7 +442,7 @@ async fn wifi_task(
     context: &crate::app::AppContext<crate::platform::EspStorage>,
 ) -> ! {
     if context
-        .with_config(|config| config.wifi().ssid().is_empty())
+        .with_config(|config| config.extension().wifi().ssid().is_empty())
         .await
     {
         run_ota_ap_mode(&mut wifi, context).await
@@ -464,7 +464,7 @@ async fn run_ota_ap_mode(
     context: &crate::app::AppContext<crate::platform::EspStorage>,
 ) -> ! {
     let mut stack_resources = embassy_net::StackResources::<4>::new();
-    context.set_ota_address(Some(core::net::SocketAddrV4::new(OTA_AP_IP, OTA_HTTP_PORT)));
+    context.extension().set_ota_address(Some(core::net::SocketAddrV4::new(OTA_AP_IP, OTA_HTTP_PORT)));
     loop {
         wait_for_ota_requested_idle(context, true).await;
 
@@ -477,7 +477,7 @@ async fn run_ota_ap_mode(
                             "Wi-Fi: device init failed: {:?}",
                             error
                         ));
-                        context.request_ota_stop();
+                        context.extension().request_ota_stop();
                         continue;
                     }
                 };
@@ -527,14 +527,14 @@ async fn run_ota_ap_session<'a>(
     );
     if dhcp_socket.bind(OTA_DHCP_SERVER_PORT).is_err() {
         crate::platform::log_fmt(format_args!("OTA: DHCP bind failed"));
-        context.request_ota_stop();
+        context.extension().request_ota_stop();
         return;
     }
     let mut dhcp = pin!(dhcp_server(&dhcp_socket));
     let ssid = ota_ssid(context).await;
     if let Err(error) = start_ota_ap(&mut controller, &ssid).await {
         crate::platform::log_fmt(format_args!("OTA: AP start failed: {:?}", error));
-        context.request_ota_stop();
+        context.extension().request_ota_stop();
         return;
     }
     crate::platform::log_fmt(format_args!(
@@ -581,7 +581,7 @@ async fn run_ota_station_mode<'a>(
     let mut runner = pin!(runner.run());
     let mut worker = pin!(async {
         loop {
-            let wifi = context.with_config(|config| config.wifi().clone()).await;
+            let wifi = context.with_config(|config| config.extension().wifi().clone()).await;
             let ssid = String::from(wifi.ssid());
             let password = String::from(wifi.password());
             if ssid.is_empty() {
@@ -675,14 +675,14 @@ async fn run_ota_station_mode<'a>(
                     use crate::app::mqtt::{ConnectionError, ConnectionState};
                     let enabled = context
                         .with_config(|config| {
-                            config.mqtt(index).is_some_and(|mqtt| !mqtt.host.is_empty())
+                            config.extension().mqtt(index).is_some_and(|mqtt| !mqtt.host.is_empty())
                         })
                         .await;
                     if enabled {
-                        context.set_mqtt_error(index, Some(ConnectionError::Unreachable));
-                        context.set_mqtt_state(index, ConnectionState::Disconnected);
+                        context.extension().set_mqtt_error(index, Some(ConnectionError::Unreachable));
+                        context.extension().set_mqtt_state(index, ConnectionState::Disconnected);
                     } else {
-                        context.set_mqtt_state(index, ConnectionState::Disabled);
+                        context.extension().set_mqtt_state(index, ConnectionState::Disabled);
                     }
                 }
             }
@@ -693,7 +693,7 @@ async fn run_ota_station_mode<'a>(
     });
     poll_fn(|cx| {
         let _ = runner.as_mut().poll(cx);
-        context.set_ota_address(
+        context.extension().set_ota_address(
             stack.config_v4().map(|config| {
                 core::net::SocketAddrV4::new(config.address.address(), OTA_HTTP_PORT)
             }),
@@ -715,28 +715,28 @@ async fn mqtt_loop(
     use crate::app::mqtt::ConnectionState;
 
     loop {
-        let generation = context.mqtt_generation();
+        let generation = context.extension().mqtt_generation();
         let mqtt = context
-            .with_config(|config| config.mqtt(index).cloned())
+            .with_config(|config| config.extension().mqtt(index).cloned())
             .await;
         let Some(mqtt) = mqtt.filter(|mqtt| !mqtt.host.is_empty()) else {
-            context.set_mqtt_state(index, ConnectionState::Disabled);
+            context.extension().set_mqtt_state(index, ConnectionState::Disabled);
             wait_mqtt_retry_or_restart(context, index, generation, 30).await;
             continue;
         };
-        context.set_mqtt_state(index, ConnectionState::Connecting);
+        context.extension().set_mqtt_state(index, ConnectionState::Connecting);
         // Keep the three TLS-capable session futures out of the fixed 32 KiB
         // Embassy task arena. Disabled brokers allocate no session state.
         let result =
             alloc::boxed::Box::pin(mqtt_session(stack, context, index, generation, &mqtt)).await;
         // Cancellation by an explicit restart is not a connection failure.
-        if context.mqtt_generation() == generation {
+        if context.extension().mqtt_generation() == generation {
             if let Err(error) = result {
-                context.set_mqtt_error(index, Some(error));
+                context.extension().set_mqtt_error(index, Some(error));
                 crate::platform::log_fmt(format_args!("MQTT {}: {}", index + 1, error.as_str()));
             }
         }
-        context.set_mqtt_state(index, ConnectionState::Disconnected);
+        context.extension().set_mqtt_state(index, ConnectionState::Disconnected);
         wait_mqtt_retry_or_restart(context, index, generation, 10).await;
     }
 }
@@ -951,17 +951,17 @@ async fn mqtt_connected<R: embedded_io_async::Read, W: embedded_io_async::Write>
             mqtt_wait_ack(&mut writer, websocket, &ack, &pong, &mut rng).await
         })
         .await?;
-        context.set_mqtt_state(index, mqtt::ConnectionState::Connected);
+        context.extension().set_mqtt_state(index, mqtt::ConnectionState::Connected);
         crate::platform::log_fmt(format_args!("MQTT {}: connected", index + 1));
         let mut next_status = embassy_time::Instant::now(); // Publish immediately after connecting.
         let mut keepalive = next_status + embassy_time::Duration::from_secs(30);
         loop {
-            let mut event = pin!(context.receive_mqtt_packet(index));
+            let mut event = pin!(context.extension().receive_mqtt_packet(index));
             let mut idle = pin!(embassy_time::Timer::at(keepalive.min(next_status)));
             let mut control = pin!(pong.wait());
             let (packet, control) = poll_fn(|cx| {
-                context.register_mqtt_waker(index, cx.waker());
-                if context.mqtt_generation() != generation {
+                context.extension().register_mqtt_waker(index, cx.waker());
+                if context.extension().mqtt_generation() != generation {
                     return Poll::Ready((None, None));
                 }
                 // Deadlines take priority so busy connections still refresh status.
@@ -1073,8 +1073,8 @@ async fn mqtt_io<T, E>(
     let mut operation = pin!(operation);
     let mut timeout = pin!(embassy_time::Timer::after_secs(10));
     poll_fn(|cx| {
-        context.register_mqtt_waker(index, cx.waker());
-        if context.mqtt_generation() != generation {
+        context.extension().register_mqtt_waker(index, cx.waker());
+        if context.extension().mqtt_generation() != generation {
             return Poll::Ready(Err(()));
         }
         if timeout.as_mut().poll(cx).is_ready() {
@@ -1097,10 +1097,10 @@ async fn wait_mqtt_retry_or_restart(
 ) {
     let mut timer = pin!(embassy_time::Timer::after_secs(seconds));
     poll_fn(|cx| {
-        if context.mqtt_generation() != generation {
+        if context.extension().mqtt_generation() != generation {
             return Poll::Ready(());
         }
-        context.register_mqtt_waker(index, cx.waker());
+        context.extension().register_mqtt_waker(index, cx.waker());
         if timer.as_mut().poll(cx).is_ready() {
             Poll::Ready(())
         } else {
@@ -1116,7 +1116,7 @@ async fn ntp_loop(
 ) -> ! {
     loop {
         let host = context
-            .with_config(|config| String::from(config.ntp()))
+            .with_config(|config| String::from(config.extension().ntp()))
             .await;
         let delay_seconds = match sync_ntp(stack, &host).await {
             Some(unix_seconds) => {
@@ -1200,7 +1200,7 @@ async fn serve_ota_session(
     stack: embassy_net::Stack<'_>,
     context: &crate::app::AppContext<crate::platform::EspStorage>,
 ) {
-    while context.ota_requested() {
+    while context.extension().ota_requested() {
         let mut rx_buffer = [0u8; 2048];
         let mut tx_buffer = [0u8; 2048];
         let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -1224,13 +1224,13 @@ async fn accept_ota_connection<'a>(
     context: &crate::app::AppContext<crate::platform::EspStorage>,
     socket: &mut embassy_net::tcp::TcpSocket<'a>,
 ) -> bool {
-    let generation = context.ota_generation();
+    let generation = context.extension().ota_generation();
     let mut accept = pin!(socket.accept(OTA_HTTP_PORT));
     poll_fn(|cx| {
-        if !context.ota_requested() || context.ota_generation() != generation {
+        if !context.extension().ota_requested() || context.extension().ota_generation() != generation {
             return Poll::Ready(false);
         }
-        context.register_ota_waker(cx.waker());
+        context.extension().register_ota_waker(cx.waker());
         match accept.as_mut().poll(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(true),
             Poll::Ready(Err(_)) => Poll::Ready(false),
@@ -1249,13 +1249,13 @@ async fn handle_ota_connection<'a>(
     context: &crate::app::AppContext<crate::platform::EspStorage>,
     socket: &mut embassy_net::tcp::TcpSocket<'a>,
 ) -> OtaConnectionResult {
-    let generation = context.ota_generation();
+    let generation = context.extension().ota_generation();
     let mut connection = pin!(crate::app::ota::handle_connection(socket));
     poll_fn(|cx| {
-        if !context.ota_requested() || context.ota_generation() != generation {
+        if !context.extension().ota_requested() || context.extension().ota_generation() != generation {
             return Poll::Ready(OtaConnectionResult::Stopped);
         }
-        context.register_ota_waker(cx.waker());
+        context.extension().register_ota_waker(cx.waker());
         match connection.as_mut().poll(cx) {
             Poll::Ready(result) => Poll::Ready(OtaConnectionResult::Complete(result)),
             Poll::Pending => Poll::Pending,
@@ -1383,18 +1383,18 @@ async fn wait_for_ota_requested_idle(
     requested: bool,
 ) {
     loop {
-        if context.ota_requested() == requested {
+        if context.extension().ota_requested() == requested {
             return;
         }
 
-        let generation = context.ota_generation();
+        let generation = context.extension().ota_generation();
         poll_fn(|cx| {
-            if context.ota_requested() == requested || context.ota_generation() != generation {
+            if context.extension().ota_requested() == requested || context.extension().ota_generation() != generation {
                 return Poll::Ready(());
             }
 
-            context.register_ota_waker(cx.waker());
-            if context.ota_requested() == requested || context.ota_generation() != generation {
+            context.extension().register_ota_waker(cx.waker());
+            if context.extension().ota_requested() == requested || context.extension().ota_generation() != generation {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -1493,7 +1493,7 @@ where
         crate::platform::spi_delay(),
     );
     let receive_config = context
-        .with_config(|config| config.radio().receive_config())
+        .with_config(|config| crate::modules::sx1262::ReceiveConfig::from(config.radio()))
         .await;
 
     let receiver = match crate::modules::sx1262::init_receiver(
@@ -1682,7 +1682,7 @@ where
     }
 }
 
-pub fn log_memory_profile(memory: crate::memory::MemoryProfile) {
+pub fn log_memory_profile(memory: mcrs_repeater::memory::MemoryProfile) {
     crate::platform::log_fmt(format_args!(
         "Memory profile: heap={} inbound_queue={} outbound_queue={} neighbours={} seen_packets={}",
         memory.heap_size,

@@ -9,9 +9,10 @@ use lora_phy::{
     sx126x::{Config, Sx126x, Sx1262, TcxoCtrlVoltage},
 };
 use mcrs_firmware::radio_metrics::{PacketStatus, StatusSpi};
+use mcrs_repeater::config::RadioConfig;
+pub use mcrs_repeater::radio::RECEIVE_PREAMBLE_LENGTH;
 
 pub const ENABLE_PUBLIC_NETWORK: bool = false;
-pub const RECEIVE_PREAMBLE_LENGTH: u16 = 8;
 pub const RECEIVE_MAX_PAYLOAD_LEN: u8 = 255;
 
 pub struct BoardConfig {
@@ -54,6 +55,59 @@ pub struct ReceiveConfig {
     pub crc_on: bool,
     pub iq_inverted: bool,
     pub transmit_output_power_dbm: i32,
+}
+
+impl From<RadioConfig> for ReceiveConfig {
+    fn from(radio: RadioConfig) -> Self {
+        Self {
+            frequency_hz: radio.receive_frequency_hz,
+            spreading_factor: spreading_factor(radio.spreading_factor),
+            bandwidth: bandwidth(radio.bandwidth_hz),
+            coding_rate: coding_rate(radio.coding_rate_denominator),
+            preamble_length: RECEIVE_PREAMBLE_LENGTH,
+            max_payload_len: RECEIVE_MAX_PAYLOAD_LEN,
+            crc_on: true,
+            iq_inverted: false,
+            transmit_output_power_dbm: radio.transmit_power_dbm,
+        }
+    }
+}
+
+fn spreading_factor(value: u8) -> SpreadingFactor {
+    match value {
+        5 => SpreadingFactor::_5,
+        6 => SpreadingFactor::_6,
+        7 => SpreadingFactor::_7,
+        9 => SpreadingFactor::_9,
+        10 => SpreadingFactor::_10,
+        11 => SpreadingFactor::_11,
+        12 => SpreadingFactor::_12,
+        _ => SpreadingFactor::_8,
+    }
+}
+
+fn bandwidth(value: u32) -> Bandwidth {
+    match value {
+        7_810 => Bandwidth::_7KHz,
+        10_420 => Bandwidth::_10KHz,
+        15_630 => Bandwidth::_15KHz,
+        20_830 => Bandwidth::_20KHz,
+        31_250 => Bandwidth::_31KHz,
+        41_670 => Bandwidth::_41KHz,
+        125_000 => Bandwidth::_125KHz,
+        250_000 => Bandwidth::_250KHz,
+        500_000 => Bandwidth::_500KHz,
+        _ => Bandwidth::_62KHz,
+    }
+}
+
+fn coding_rate(value: u8) -> CodingRate {
+    match value {
+        5 => CodingRate::_4_5,
+        6 => CodingRate::_4_6,
+        7 => CodingRate::_4_7,
+        _ => CodingRate::_4_8,
+    }
 }
 
 pub struct Receiver<SPI, CTRL, WAIT, DLY>

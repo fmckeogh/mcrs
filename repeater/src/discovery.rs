@@ -1,20 +1,21 @@
-extern crate alloc;
-
 use alloc::{string::String, vec::Vec};
 use mcrs_protocol::{
     AdvertAppData, AdvertNodeType, AdvertPayload, ControlMessage, ControlPayload, HashSize,
     MAX_ADVERT_DATA_SIZE, Packet, Path, Payload, RoutePath, RouteType,
 };
 
-use super::{AppContext, config::AppConfig};
+use super::{
+    AppContext, Extension,
+    config::{AppConfig, ExtensionConfig},
+};
 
 pub const DISCOVER_NEIGHBOURS_TTL_MS: u64 = 60_000;
 
-pub fn zero_hop_advert(config: &AppConfig) -> Option<Vec<u8>> {
+pub fn zero_hop_advert<C: ExtensionConfig>(config: &AppConfig<C>) -> Option<Vec<u8>> {
     advert(config, RouteType::Direct)
 }
 
-pub fn flood_advert(config: &AppConfig) -> Option<Vec<u8>> {
+pub fn flood_advert<C: ExtensionConfig>(config: &AppConfig<C>) -> Option<Vec<u8>> {
     let mut packet = advert_packet(config, RouteType::Flood)?;
     let default_region = config
         .regions()
@@ -40,11 +41,14 @@ pub fn flood_advert(config: &AppConfig) -> Option<Vec<u8>> {
     packet.encode().ok()
 }
 
-fn advert(config: &AppConfig, route_type: RouteType) -> Option<Vec<u8>> {
+fn advert<C: ExtensionConfig>(config: &AppConfig<C>, route_type: RouteType) -> Option<Vec<u8>> {
     advert_packet(config, route_type)?.encode().ok()
 }
 
-fn advert_packet(config: &AppConfig, route_type: RouteType) -> Option<Packet> {
+fn advert_packet<C: ExtensionConfig>(
+    config: &AppConfig<C>,
+    route_type: RouteType,
+) -> Option<Packet> {
     crate::platform::log_fmt(format_args!(
         "Advert: sending {} name={}",
         route_type_name(route_type),
@@ -81,7 +85,7 @@ fn advert_packet(config: &AppConfig, route_type: RouteType) -> Option<Packet> {
     })
 }
 
-fn advert_path(config: &AppConfig) -> Option<Path> {
+fn advert_path<C: ExtensionConfig>(config: &AppConfig<C>) -> Option<Path> {
     Path::new(
         HashSize::from_code(config.path_hash_mode()).ok()?,
         Vec::new(),
@@ -133,15 +137,16 @@ pub fn discover_neighbours_request(tag: u32) -> Option<Vec<u8>> {
     .ok()
 }
 
-pub async fn handle_control_packet<S>(
+pub async fn handle_control_packet<S, X>(
     packet: &Packet,
-    context: &AppContext<S>,
+    context: &AppContext<S, X>,
     rssi: i16,
     snr_quarters: i16,
     now_ms: u64,
 ) -> Option<Vec<u8>>
 where
     S: crate::platform::storage::Storage,
+    X: Extension,
 {
     if !is_zero_hop(packet) {
         return None;
@@ -175,8 +180,8 @@ where
     }
 }
 
-async fn handle_discover_request<S>(
-    context: &AppContext<S>,
+async fn handle_discover_request<S, X>(
+    context: &AppContext<S, X>,
     snr_quarters: i16,
     prefix_only: bool,
     type_filter: u8,
@@ -185,6 +190,7 @@ async fn handle_discover_request<S>(
 ) -> Option<Vec<u8>>
 where
     S: crate::platform::storage::Storage,
+    X: Extension,
 {
     if !context.with_config(|config| config.repeat_enabled()).await {
         return None;
@@ -216,8 +222,8 @@ where
     .ok()
 }
 
-async fn handle_discover_response<S>(
-    context: &AppContext<S>,
+async fn handle_discover_response<S, X>(
+    context: &AppContext<S, X>,
     rssi: i16,
     snr_quarters: i16,
     now_ms: u64,
@@ -226,6 +232,7 @@ async fn handle_discover_response<S>(
     pubkey: &[u8],
 ) where
     S: crate::platform::storage::Storage,
+    X: Extension,
 {
     if node_type != AdvertNodeType::Repeater || pubkey.len() != mcrs_protocol::PUB_KEY_SIZE {
         return;

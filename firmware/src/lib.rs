@@ -1,4 +1,4 @@
-//! Platform-independent firmware transport components.
+//! Platform-independent firmware network components.
 #![no_std]
 extern crate alloc;
 
@@ -10,13 +10,7 @@ pub mod mqtt_transport;
 #[path = "app/mqtt.rs"]
 pub mod mqtt;
 
+#[path = "app/network.rs"]
+pub mod network;
+
 pub mod radio_metrics;
-
-#[cfg(test)]
-mod crypto_tests;
-#[cfg(test)]
-use crypto_tests::platform;
-
-#[cfg(test)]
-#[path = "app/periodic/schedule.rs"]
-mod advert_schedule;

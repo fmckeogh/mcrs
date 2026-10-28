@@ -1,6 +1,5 @@
-extern crate alloc;
-
-use super::AppContext;
+use super::{AppContext, Extension};
+use crate::platform::storage::Storage;
 use alloc::{format, string::String, vec, vec::Vec};
 use core::fmt::Write;
 use mcrs_protocol::{
@@ -21,7 +20,6 @@ const REQ_TYPE_GET_OWNER_INFO: u8 = 0x07;
 const LPP_CHANNEL_SELF: u8 = 1;
 const LPP_TYPE_VOLTAGE: u8 = 116;
 const REPEATER_STATS_LEN: usize = 56;
-const FIRMWARE_VERSION: &str = concat!("MCRS ", env!("MESHCORE_FIRMWARE_VERSION"));
 
 pub struct Cli {
     line: [u8; LINE_BUFFER_LEN],
@@ -80,9 +78,10 @@ impl Cli {
         }
     }
 
-    pub async fn accept_byte<Store>(&mut self, byte: u8, context: &AppContext<Store>)
+    pub async fn accept_byte<S, X>(&mut self, byte: u8, context: &AppContext<S, X>)
     where
-        Store: crate::platform::storage::Storage,
+        S: Storage,
+        X: Extension,
     {
         match byte {
             b'\r' | b'\n' => self.submit(context).await,
@@ -101,9 +100,10 @@ impl Cli {
         }
     }
 
-    async fn submit<Store>(&mut self, context: &AppContext<Store>)
+    async fn submit<S, X>(&mut self, context: &AppContext<S, X>)
     where
-        Store: crate::platform::storage::Storage,
+        S: Storage,
+        X: Extension,
     {
         if self.len == 0 {
             return;
@@ -120,22 +120,24 @@ impl Cli {
     }
 }
 
-pub async fn handle_privileged_tcp_command<Store>(
+pub async fn handle_privileged_tcp_command<S, X>(
     command: &str,
-    context: &AppContext<Store>,
+    context: &AppContext<S, X>,
 ) -> Option<CliResponse>
 where
-    Store: crate::platform::storage::Storage,
+    S: Storage,
+    X: Extension,
 {
     handle_command(command.trim(), context, CliRequest::tcp()).await
 }
 
-pub async fn handle_remote_packet<Store>(
+pub async fn handle_remote_packet<S, X>(
     packet: &Packet,
-    context: &AppContext<Store>,
+    context: &AppContext<S, X>,
 ) -> Option<alloc::vec::Vec<u8>>
 where
-    Store: crate::platform::storage::Storage,
+    S: Storage,
+    X: Extension,
 {
     if let Payload::AnonymousRequest(payload) = &packet.payload {
         let reply_path = if packet.route_type.is_flood() {
@@ -172,7 +174,7 @@ where
 async fn handle_anonymous_request(
     payload: &mcrs_protocol::AnonymousRequestPayload,
     reply_path: mcrs_protocol::Path,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
 ) -> Option<alloc::vec::Vec<u8>> {
     let (decrypted, responder_public_key) = context
         .with_identity(|identity| {
@@ -265,7 +267,7 @@ async fn handle_anonymous_request(
 
 async fn handle_authenticated_text_message(
     payload: &mcrs_protocol::DirectEncryptedPayload,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
 ) -> Option<alloc::vec::Vec<u8>> {
     let now_ms = crate::platform::now_millis();
     let sessions = context
@@ -345,7 +347,7 @@ fn split_cli_correlation_prefix(command: &str) -> (Option<&str>, &str) {
 async fn handle_authenticated_request(
     packet: &Packet,
     payload: &mcrs_protocol::DirectEncryptedPayload,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
 ) -> Option<Vec<u8>> {
     let flood_region = if packet.route_type.is_flood() {
         let region = context
@@ -401,7 +403,7 @@ async fn handle_authenticated_request(
 
 async fn decrypt_authenticated_payload(
     payload: &mcrs_protocol::DirectEncryptedPayload,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     now_ms: u64,
 ) -> Option<super::crypto::AuthenticatedPlaintext> {
     let sessions = context
@@ -424,7 +426,7 @@ async fn decrypt_authenticated_payload(
 
 async fn handle_binary_request(
     request: &RequestPlaintext,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     now_ms: u64,
     privilege: super::remote::RemotePrivilege,
 ) -> Option<Vec<u8>> {
@@ -485,7 +487,7 @@ async fn handle_binary_request(
 async fn handle_anonymous_subrequest(
     body: &[u8],
     request_timestamp: u32,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
 ) -> Option<Vec<u8>> {
     match body.first().copied()? {
         ANON_REQ_TYPE_BASIC => Some(
@@ -540,7 +542,7 @@ fn anonymous_basic_response(request_timestamp: u32, repeat_enabled: bool) -> Vec
 fn owner_info_response(request_timestamp: u32, node_name: &str, owner_info: &str) -> Vec<u8> {
     let mut response = Vec::new();
     response.extend_from_slice(&request_timestamp.to_le_bytes());
-    response.extend_from_slice(FIRMWARE_VERSION.as_bytes());
+    response.extend_from_slice(crate::platform::firmware_version().as_bytes());
     response.push(b'\n');
     response.extend_from_slice(node_name.as_bytes());
     response.push(b'\n');
@@ -610,11 +612,19 @@ fn encode_status_binary_response(status: super::Status, out: &mut Vec<u8>) {
 
 async fn handle_command(
     command: &str,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     request: CliRequest,
 ) -> Option<CliResponse> {
     if !request.allows_command(command) {
         let output = denied_text();
+        return Some(command_response(request, output));
+    }
+
+    if let Some(output) = context
+        .extension()
+        .handle_command(context, command, request)
+        .await
+    {
         return Some(command_response(request, output));
     }
 
@@ -640,41 +650,6 @@ async fn handle_command(
 
     if command == "region" || command.starts_with("region ") {
         let output = handle_region_command(command, context, request).await;
-        return Some(command_response(request, output));
-    }
-
-    if command == "ota" || command.starts_with("ota ") {
-        let output = handle_ota_command(command, context, request);
-        return Some(command_response(request, output));
-    }
-
-    #[cfg(feature = "mqtt")]
-    if command == "mqtt status" {
-        let output = if request.origin.is_local() {
-            let mut output = String::new();
-            for index in 0..super::config::MQTT_SERVER_COUNT {
-                let state = context.mqtt_state(index);
-                let _ = write!(&mut output, "MQTT {}: {}", index + 1, state.as_str());
-                if let Some(error) = context.mqtt_error(index) {
-                    let _ = write!(&mut output, " (last error: {})", error.as_str());
-                }
-                output.push('\n');
-            }
-            output
-        } else {
-            denied_text()
-        };
-        return Some(command_response(request, output));
-    }
-
-    #[cfg(feature = "mqtt")]
-    if command == "mqtt restart" {
-        let output = if request.origin.is_local() && request.privilege.is_passworded() {
-            context.request_mqtt_restart();
-            String::from("OK - MQTT restarting")
-        } else {
-            denied_text()
-        };
         return Some(command_response(request, output));
     }
 
@@ -704,7 +679,7 @@ async fn handle_command(
     let mut post_reply = None;
     let output = match command {
         "" => return None,
-        "help" | "?" => help_text(),
+        "help" | "?" => help_text(context.extension()),
         "export config" | "export config all" | "export config delta" => {
             if request.origin.is_local() && request.privilege.is_passworded() {
                 context
@@ -840,10 +815,10 @@ async fn handle_command(
             }
         }
         "status" => status_text(context),
-        "ver" | "version" => String::from(FIRMWARE_VERSION),
+        "ver" | "version" => String::from(crate::platform::firmware_version()),
         _ => {
             let mut output = format!("CLI: unknown command '{}'\n", command);
-            output.push_str(&help_text());
+            output.push_str(&help_text(context.extension()));
             output
         }
     };
@@ -863,37 +838,9 @@ fn command_response(request: CliRequest, text: String) -> CliResponse {
 
 async fn handle_get_command(
     config: &str,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     request: CliRequest,
 ) -> String {
-    #[cfg(feature = "mqtt")]
-    if let Some((index, key)) = parse_mqtt_setting(config) {
-        if !request.origin.is_local() {
-            return denied_text();
-        }
-        return context
-            .with_config(|app_config| {
-                app_config
-                    .mqtt(index)
-                    .and_then(|mqtt| mqtt.value(key))
-                    .map(|value| format!("> {value}"))
-                    .unwrap_or_else(|| format!("Unknown config: {config}"))
-            })
-            .await;
-    }
-    if let Some(key) = config.strip_prefix("wifi.") {
-        if !request.origin.is_local() {
-            return denied_text();
-        }
-        return context
-            .with_config(|config| match key {
-                "ssid" => format!("> {}", config.wifi().ssid()),
-                "pass" => format!("> {}", config.wifi().password()),
-                "telnet" => format!("> {}", on_off_text(config.wifi().telnet())),
-                _ => format!("Unknown config: wifi.{key}"),
-            })
-            .await;
-    }
     match config {
         "owner.info" => {
             context
@@ -1010,11 +957,6 @@ async fn handle_get_command(
                 .with_config(|config| format!("> {}", config.loop_detection().as_str()))
                 .await
         }
-        "ntp" => {
-            context
-                .with_config(|config| format!("> {}", config.ntp()))
-                .await
-        }
         "status" => status_text(context),
         _ => format!("Unknown config: {}", config),
     }
@@ -1022,19 +964,11 @@ async fn handle_get_command(
 
 async fn handle_set_command(
     config: &str,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     request: CliRequest,
 ) -> String {
     if !request.privilege.is_passworded() {
         return denied_text();
-    }
-
-    if config == "ntp" || config.starts_with("ntp ") {
-        let host = config.strip_prefix("ntp").unwrap().trim();
-        return match context.update_config(|config| config.set_ntp(host)).await {
-            Ok(()) => String::from("OK - applies at next NTP sync"),
-            Err(error) => format!("Error: {error}"),
-        };
     }
 
     if config == "acl" || config.starts_with("acl ") {
@@ -1051,72 +985,6 @@ async fn handle_set_command(
             .await
         {
             Ok(()) => String::from("OK"),
-            Err(error) => format!("Error: {error}"),
-        };
-    }
-
-    #[cfg(feature = "mqtt")]
-    if let Some(setting) = config.strip_prefix("mqtt.") {
-        if !request.origin.is_local() {
-            return denied_text();
-        }
-        let Some((key, value)) = setting.split_once(' ') else {
-            return String::from("Error, missing MQTT value");
-        };
-        let full_key = format!("mqtt.{}", key.trim());
-        let Some((index, field)) = parse_mqtt_setting(&full_key) else {
-            return String::from("Error, invalid MQTT setting (use mqtt.1 through mqtt.3)");
-        };
-        // The command line is trimmed before parsing, so an explicit empty
-        // string is needed to clear credentials or an audience override.
-        let value = match value.trim() {
-            "\"\"" => "",
-            value => value,
-        };
-        return match context
-            .update_config(|config| config.set_mqtt_value(index, field, value))
-            .await
-        {
-            Ok(()) => String::from("OK - run 'mqtt restart' to apply"),
-            Err(error) => format!("Error: {error}"),
-        };
-    }
-
-    if let Some(setting) = config.strip_prefix("wifi.") {
-        if !request.origin.is_local() {
-            return denied_text();
-        }
-        let (key, value) = match setting.split_once(' ') {
-            Some((key, value)) => (key.trim(), value.trim()),
-            None if setting.trim() == "pass" => ("pass", ""),
-            None => return String::from("Error, missing Wi-Fi value"),
-        };
-        let result = match key {
-            "ssid" => {
-                context
-                    .update_config(|config| config.set_wifi_ssid(value))
-                    .await
-            }
-            "pass" => {
-                context
-                    .update_config(|config| config.set_wifi_password(value))
-                    .await
-            }
-            "telnet" => {
-                let Some(enabled) = parse_bool(value) else {
-                    return String::from("Error, invalid wifi.telnet value");
-                };
-                context
-                    .update_config(|config| {
-                        config.set_wifi_telnet(enabled);
-                        Ok(())
-                    })
-                    .await
-            }
-            _ => return String::from("Error, unknown Wi-Fi setting"),
-        };
-        return match result {
-            Ok(()) => String::from("OK - reboot to apply"),
             Err(error) => format!("Error: {error}"),
         };
     }
@@ -1170,7 +1038,7 @@ async fn handle_set_command(
     }
 
     if let Some(latitude) = config.strip_prefix("lat ").map(str::trim) {
-        let Some(latitude) = crate::app::config::parse_latitude_microdegrees(latitude) else {
+        let Some(latitude) = crate::config::parse_latitude_microdegrees(latitude) else {
             return String::from("Error, invalid latitude");
         };
         return match context
@@ -1190,7 +1058,7 @@ async fn handle_set_command(
     }
 
     if let Some(longitude) = config.strip_prefix("lon ").map(str::trim) {
-        let Some(longitude) = crate::app::config::parse_longitude_microdegrees(longitude) else {
+        let Some(longitude) = crate::config::parse_longitude_microdegrees(longitude) else {
             return String::from("Error, invalid longitude");
         };
         return match context
@@ -1273,7 +1141,7 @@ async fn handle_set_command(
     }
 
     if let Some(hops) = config.strip_prefix("flood.max.unscoped ").map(str::trim) {
-        let Some(hops) = crate::app::config::parse_flood_max_hops(hops) else {
+        let Some(hops) = crate::config::parse_flood_max_hops(hops) else {
             return String::from("Error, invalid flood max hops");
         };
         return match context
@@ -1286,7 +1154,7 @@ async fn handle_set_command(
     }
 
     if let Some(hops) = config.strip_prefix("flood.max.advert ").map(str::trim) {
-        let Some(hops) = crate::app::config::parse_flood_max_hops(hops) else {
+        let Some(hops) = crate::config::parse_flood_max_hops(hops) else {
             return String::from("Error, invalid flood max hops");
         };
         return match context
@@ -1352,7 +1220,7 @@ async fn handle_set_command(
     }
 
     if let Some(mode) = config.strip_prefix("path.hash.mode ").map(str::trim) {
-        let Some(mode) = crate::app::config::parse_path_hash_mode(mode) else {
+        let Some(mode) = crate::config::parse_path_hash_mode(mode) else {
             return String::from("Error, invalid path hash mode");
         };
         return match context
@@ -1400,17 +1268,9 @@ async fn handle_set_command(
     format!("Unknown config: {}", config)
 }
 
-#[cfg(feature = "mqtt")]
-fn parse_mqtt_setting(setting: &str) -> Option<(usize, &str)> {
-    let setting = setting.strip_prefix("mqtt.")?;
-    let (number, key) = setting.split_once('.')?;
-    let index = number.parse::<usize>().ok()?.checked_sub(1)?;
-    (index < super::config::MQTT_SERVER_COUNT).then_some((index, key))
-}
-
 async fn handle_unset_command(
     setting: &str,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     request: CliRequest,
 ) -> String {
     if !request.privilege.is_passworded() {
@@ -1419,24 +1279,12 @@ async fn handle_unset_command(
     if setting.is_empty() {
         return String::from("Error, missing config name");
     }
-    if (setting.starts_with("wifi.") || setting.starts_with("mqtt.") || setting == "freq")
-        && !request.origin.is_local()
-    {
+    if setting == "freq" && !request.origin.is_local() {
         return denied_text();
     }
 
     match context.update_config(|config| config.unset(setting)).await {
-        #[cfg(feature = "mqtt")]
-        Ok(()) if matches!(setting, "mqtt.1" | "mqtt.2" | "mqtt.3") => {
-            context.request_mqtt_restart();
-            String::from("OK - MQTT server reset to defaults; MQTT restarting")
-        }
-        Ok(())
-            if matches!(
-                setting,
-                "wifi.ssid" | "wifi.pass" | "wifi.telnet" | "radio" | "freq" | "tx"
-            ) =>
-        {
+        Ok(()) if matches!(setting, "radio" | "freq" | "tx") => {
             String::from("OK - reset to default; reboot to apply")
         }
         Ok(()) => String::from("OK - reset to default"),
@@ -1449,7 +1297,7 @@ async fn handle_unset_command(
 
 async fn handle_region_command(
     command: &str,
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     request: CliRequest,
 ) -> String {
     let mut parts = command.split_ascii_whitespace();
@@ -1610,51 +1458,6 @@ async fn handle_region_command(
     }
 }
 
-fn handle_ota_command(
-    command: &str,
-    context: &AppContext<impl crate::platform::storage::Storage>,
-    request: CliRequest,
-) -> String {
-    let mut parts = command.split_ascii_whitespace();
-    let _ota = parts.next();
-    match parts.next() {
-        None | Some("status") => ota_status_text(),
-        Some("start") => {
-            if !request.privilege.is_passworded() {
-                denied_text()
-            } else {
-                context.request_ota_start();
-                match context.ota_address() {
-                    Some(address) => format!("OTA: start requested; http://{}/", address),
-                    None => String::from("OTA: start requested; waiting for Wi-Fi"),
-                }
-            }
-        }
-        Some("stop") => {
-            if !request.privilege.is_passworded() {
-                denied_text()
-            } else {
-                context.request_ota_stop();
-                String::from("OTA: stop requested")
-            }
-        }
-        _ => String::from("Err - use 'ota status', 'ota start', or 'ota stop'"),
-    }
-}
-
-fn ota_status_text() -> String {
-    let status = crate::platform::ota_status();
-    if !status.available {
-        return String::from("OTA: unavailable");
-    }
-
-    let next = status.next.unwrap_or("unknown");
-    format!(
-        "OTA: selected={} next={} next_size={}",
-        status.selected, next, status.next_size
-    )
-}
-
 fn handle_time_set_command(seconds: &str, request: CliRequest) -> String {
     if !request.privilege.is_passworded() {
         return denied_text();
@@ -1673,8 +1476,8 @@ fn handle_time_set_command(seconds: &str, request: CliRequest) -> String {
 
 fn parse_radio_config(
     input: &str,
-    mut current: crate::app::config::RadioConfig,
-) -> Option<crate::app::config::RadioConfig> {
+    mut current: crate::config::RadioConfig,
+) -> Option<crate::config::RadioConfig> {
     let mut parts = input.split(|byte: char| byte.is_ascii_whitespace() || byte == ',');
     let frequency = parts.next().filter(|part| !part.is_empty())?;
     let bandwidth = parts.next().filter(|part| !part.is_empty())?;
@@ -1807,7 +1610,7 @@ fn packet_targets_this_node(packet: &Packet, node_hash: &[u8]) -> bool {
     path.hop_count() == 0 || path.first_hash_matches(node_hash)
 }
 
-fn parse_bool(input: &str) -> Option<bool> {
+pub fn parse_bool(input: &str) -> Option<bool> {
     match input {
         "true" | "yes" | "on" | "1" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
@@ -1815,7 +1618,7 @@ fn parse_bool(input: &str) -> Option<bool> {
     }
 }
 
-fn on_off_text(value: bool) -> &'static str {
+pub fn on_off_text(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
@@ -1862,17 +1665,19 @@ fn log_command_output(request: CliRequest, output: &str) {
     }
 }
 
-fn denied_text() -> String {
+pub fn denied_text() -> String {
     String::from("CLI: denied, command requires passworded login")
 }
 
-fn help_text() -> String {
-    String::from(
-        "Commands: help, ver, status, identity, radio, clock, region, region list {allowed|denied}, ota status, get {name|owner.info|lat|lon|radio|tx|dutycycle|freq|flood.max.unscoped|flood.max.advert|repeat|advert.interval|flood.advert.interval|path.hash.mode|loop.detect|public.key|status}; Privileged: time, clock sync, set, unset, set acl <pubkey> admin|deny, unset acl <pubkey>, password, neighbours, advert, advert.zerohop, discover.neighbours, region {put|remove|allowf|denyf|default}, ota {start|stop}, export config [all|delta] (serial/telnet), erase config, reboot",
+fn help_text(extension: &impl Extension) -> String {
+    format!(
+        "Commands: help, ver, status, identity, radio, clock, region, region list {{allowed|denied}}{}, get {{name|owner.info|lat|lon|radio|tx|dutycycle|freq|flood.max.unscoped|flood.max.advert|repeat|advert.interval|flood.advert.interval|path.hash.mode|loop.detect|public.key|status}}; Privileged: time, clock sync, set, unset, set acl <pubkey> admin|deny, unset acl <pubkey>, password, neighbours, advert, advert.zerohop, discover.neighbours, region {{put|remove|allowf|denyf|default}}{}, export config [all|delta] (serial/telnet), erase config, reboot",
+        extension.help_commands(),
+        extension.help_privileged_commands(),
     )
 }
 
-fn status_text(context: &AppContext<impl crate::platform::storage::Storage>) -> String {
+fn status_text(context: &AppContext<impl Storage, impl Extension>) -> String {
     let status = context.status();
     let mut output = String::new();
     let _ = writeln!(output, "Uptime: {}s", status.uptime_seconds);
@@ -1920,7 +1725,7 @@ fn status_text(context: &AppContext<impl crate::platform::storage::Storage>) -> 
     output
 }
 async fn enqueue_command_packet(
-    context: &AppContext<impl crate::platform::storage::Storage>,
+    context: &AppContext<impl Storage, impl Extension>,
     packet: Option<Vec<u8>>,
     success: &str,
 ) -> String {
@@ -1988,8 +1793,9 @@ fn truncate_to_remote_reply_len(output: &mut String) {
     output.truncate(REMOTE_CLI_REPLY_MAX_LEN);
 }
 
+/// Where a CLI command came from, and what its sender may do.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct CliRequest {
+pub struct CliRequest {
     origin: CliOrigin,
     privilege: CliPrivilege,
     sender_timestamp: u32,
@@ -2029,6 +1835,16 @@ impl CliRequest {
             command,
             "status" | "neighbours" | "neighbors" | "get status"
         )
+    }
+
+    /// Whether the command arrived on the serial console or over telnet.
+    pub fn is_local(self) -> bool {
+        self.origin.is_local()
+    }
+
+    /// Whether the sender may run privileged commands.
+    pub fn is_passworded(self) -> bool {
+        self.privilege.is_passworded()
     }
 }
 
@@ -2072,6 +1888,7 @@ mod tests {
 
     #[test]
     fn anonymous_basic_response_reports_disabled_repeater() {
+        crate::platform::test::install();
         for (enabled, features) in [(true, 0), (false, 0x80)] {
             let response = super::anonymous_basic_response(0x12345678, enabled);
             assert_eq!(&response[..4], &0x12345678u32.to_le_bytes());
@@ -2082,12 +1899,18 @@ mod tests {
 
     #[test]
     fn owner_info_responses_match_meshcore() {
+        crate::platform::test::install();
         for owner in ["", "Alice\nalice@example.org"] {
             let authenticated = super::owner_info_response(0x12345678, "Repeater", owner);
             assert_eq!(&authenticated[..4], &0x12345678u32.to_le_bytes());
             assert_eq!(
                 &authenticated[4..],
-                alloc::format!("{}\nRepeater\n{}", super::FIRMWARE_VERSION, owner).as_bytes()
+                alloc::format!(
+                    "{}\nRepeater\n{}",
+                    crate::platform::firmware_version(),
+                    owner
+                )
+                .as_bytes()
             );
             let anonymous = super::anonymous_owner_response(0x12345678, "Repeater", owner);
             assert_eq!(&anonymous[..4], &0x12345678u32.to_le_bytes());
@@ -2096,6 +1919,24 @@ mod tests {
                 alloc::format!("Repeater\n{}", owner).as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn help_lists_extension_commands() {
+        struct Commands;
+        impl crate::Extension for Commands {
+            type Config = ();
+            fn help_commands(&self) -> &'static str {
+                ", extra status"
+            }
+            fn help_privileged_commands(&self) -> &'static str {
+                ", extra start"
+            }
+        }
+        let help = super::help_text(&Commands);
+        assert!(help.contains("region list {allowed|denied}, extra status, get {name|"));
+        assert!(help.contains("region {put|remove|allowf|denyf|default}, extra start, export"));
+        assert!(!super::help_text(&()).contains("extra"));
     }
 
     #[test]

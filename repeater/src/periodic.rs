@@ -1,14 +1,15 @@
 use embedded_hal_async::delay::DelayNs;
 
-use super::AppContext;
+use super::{AppContext, Extension};
 
 mod schedule;
 
 use schedule::Schedule;
 
-pub async fn run<S, D>(context: &AppContext<S>, delay: &mut D) -> !
+pub async fn run<S, X, D>(context: &AppContext<S, X>, delay: &mut D) -> !
 where
     S: crate::platform::storage::Storage,
+    X: Extension,
     D: DelayNs,
 {
     let (advert_interval, flood_interval) = context
@@ -57,9 +58,13 @@ where
     }
 }
 
-async fn send_advert<S>(context: &AppContext<S>, packet: Option<alloc::vec::Vec<u8>>, kind: &str)
-where
+async fn send_advert<S, X>(
+    context: &AppContext<S, X>,
+    packet: Option<alloc::vec::Vec<u8>>,
+    kind: &str,
+) where
     S: crate::platform::storage::Storage,
+    X: Extension,
 {
     let Some(packet) = packet else {
         crate::platform::log_fmt(format_args!("Periodic: {} advert encode failed", kind));

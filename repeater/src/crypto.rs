@@ -1,5 +1,3 @@
-extern crate alloc;
-
 use aes::{
     Aes128,
     cipher::{Block, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit},

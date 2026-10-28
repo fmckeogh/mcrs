@@ -1,5 +1,3 @@
-extern crate alloc;
-
 use alloc::{string::String, vec::Vec};
 use core::fmt::{self, Write};
 
@@ -8,6 +6,12 @@ use super::{
     identity::{self, Identity, PrivateKey},
     regions::{RegionError, RegionMap},
 };
+
+// Unit tests use the base defaults alone, whichever profile is selected.
+#[cfg(all(mcrs_profile, not(test)))]
+const PROFILE_CONFIG: &str = include_str!(env!("MCRS_PROFILE_PATH"));
+#[cfg(any(not(mcrs_profile), test))]
+const PROFILE_CONFIG: &str = "";
 
 fn clamp_advert_interval(minutes: u32) -> u32 {
     match minutes {
@@ -20,15 +24,8 @@ const APP_CONFIG_KEY: &str = "app.conf";
 const APP_CONFIG_TEXT_VERSION: u8 = 1;
 const APP_CONFIG_MAX_LEN: usize = 4096;
 const MAX_REMOTE_PASSWORD_LEN: usize = 64;
-const MAX_WIFI_SSID_LEN: usize = 32;
-const MIN_WIFI_PASSWORD_LEN: usize = 8;
-const MAX_WIFI_PASSWORD_LEN: usize = 63;
 const MAX_NODE_NAME_LEN: usize = 31;
 const MAX_OWNER_INFO_LEN: usize = 119;
-#[cfg(feature = "mqtt")]
-const MAX_MQTT_VALUE_LEN: usize = 255;
-#[cfg(feature = "mqtt")]
-pub const MQTT_SERVER_COUNT: usize = 3;
 const UNPROVISIONED_CONFIG_TEXT: &[u8] = b"# MCRS app.conf\nversion=1\n";
 const COORDINATE_SCALE: i32 = 1_000_000;
 const MIN_LATITUDE_MICRODEGREES: i32 = -90 * COORDINATE_SCALE;
@@ -36,7 +33,50 @@ const MAX_LATITUDE_MICRODEGREES: i32 = 90 * COORDINATE_SCALE;
 const MIN_LONGITUDE_MICRODEGREES: i32 = -180 * COORDINATE_SCALE;
 const MAX_LONGITUDE_MICRODEGREES: i32 = 180 * COORDINATE_SCALE;
 
-pub struct AppConfig {
+/// Settings for firmware features outside the repeater, such as networking.
+/// They are layered and stored in app.conf alongside the repeater settings.
+pub trait ExtensionConfig: Clone + Default {
+    /// Applies one setting from a config layer. Returns `None` for keys the
+    /// extension does not own, and `Some(Err(()))` for invalid values.
+    fn decode(&mut self, key: &str, value: String, source: ConfigSource)
+    -> Option<Result<(), ()>>;
+
+    /// Checks the combined settings after a layer has been applied.
+    fn validate(&self) -> bool {
+        true
+    }
+
+    /// Writes the settings that differ from `defaults`.
+    fn encode_changed(&self, defaults: &Self, redact_secrets: bool, out: &mut String);
+
+    /// Writes every setting.
+    fn encode_all(&self, redact_secrets: bool, out: &mut String);
+
+    /// Restores one setting to its default, or returns `UnknownSetting`.
+    fn unset(&mut self, setting: &str, defaults: &Self) -> Result<(), ConfigError>;
+}
+
+impl ExtensionConfig for () {
+    fn decode(
+        &mut self,
+        _key: &str,
+        _value: String,
+        source: ConfigSource,
+    ) -> Option<Result<(), ()>> {
+        // The base file contains settings for optional firmware features.
+        (source == ConfigSource::Defaults).then_some(Ok(()))
+    }
+
+    fn encode_changed(&self, _defaults: &Self, _redact_secrets: bool, _out: &mut String) {}
+
+    fn encode_all(&self, _redact_secrets: bool, _out: &mut String) {}
+
+    fn unset(&mut self, _setting: &str, _defaults: &Self) -> Result<(), ConfigError> {
+        Err(ConfigError::UnknownSetting)
+    }
+}
+
+pub struct AppConfig<C> {
     identity: Identity,
     private_key: PrivateKey,
     identity_label: &'static str,
@@ -46,8 +86,6 @@ pub struct AppConfig {
     owner_info: String,
     remote_cli_password: String,
     acl: super::acl::Acl,
-    ntp: String,
-    wifi: WifiConfig,
     radio: RadioConfig,
     regions: RegionMap,
     region_capture: bool,
@@ -59,30 +97,7 @@ pub struct AppConfig {
     loop_detection: LoopDetection,
     path_hash_mode: u8,
     duty_cycle_percent: u8,
-    #[cfg(feature = "mqtt")]
-    mqtt: [MqttConfig; MQTT_SERVER_COUNT],
-}
-
-#[cfg(feature = "mqtt")]
-pub use super::mqtt::MqttConfig;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WifiConfig {
-    ssid: String,
-    password: String,
-    telnet: bool,
-}
-
-impl WifiConfig {
-    pub fn ssid(&self) -> &str {
-        &self.ssid
-    }
-    pub fn password(&self) -> &str {
-        &self.password
-    }
-    pub fn telnet(&self) -> bool {
-        self.telnet
-    }
+    extension: C,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +109,7 @@ pub struct RadioConfig {
     pub transmit_power_dbm: i32,
 }
 
-impl AppConfig {
+impl<C: ExtensionConfig> AppConfig<C> {
     pub fn generated_defaults(identity_seed: [u8; 32]) -> Self {
         Self::from_stored(
             StoredAppConfig::default_with_identity_seed(identity_seed),
@@ -125,7 +140,7 @@ impl AppConfig {
         Self::from_stored(stored, identity_label)
     }
 
-    fn from_stored(stored: StoredAppConfig, identity_label: &'static str) -> Self {
+    fn from_stored(stored: StoredAppConfig<C>, identity_label: &'static str) -> Self {
         Self {
             identity: Identity::from_private_key(stored.private_key),
             private_key: stored.private_key,
@@ -136,8 +151,6 @@ impl AppConfig {
             owner_info: stored.owner_info,
             remote_cli_password: stored.remote_cli_password,
             acl: stored.acl,
-            ntp: stored.ntp,
-            wifi: stored.wifi,
             radio: stored.radio,
             regions: stored.regions,
             region_capture: stored.region_capture,
@@ -149,8 +162,7 @@ impl AppConfig {
             loop_detection: stored.loop_detection,
             path_hash_mode: stored.path_hash_mode,
             duty_cycle_percent: stored.duty_cycle_percent,
-            #[cfg(feature = "mqtt")]
-            mqtt: stored.mqtt,
+            extension: stored.extension,
         }
     }
 
@@ -194,83 +206,12 @@ impl AppConfig {
         &self.remote_cli_password
     }
 
-    pub fn ntp(&self) -> &str {
-        &self.ntp
+    pub fn extension(&self) -> &C {
+        &self.extension
     }
 
-    pub fn set_ntp(&mut self, value: &str) -> Result<(), ConfigError> {
-        validate_ntp_host(value)?;
-        self.ntp = value.into();
-        Ok(())
-    }
-
-    pub fn wifi(&self) -> &WifiConfig {
-        &self.wifi
-    }
-
-    pub fn set_wifi_ssid(&mut self, value: &str) -> Result<(), ConfigError> {
-        if value.len() > MAX_WIFI_SSID_LEN {
-            return Err(ConfigError::InvalidWifiConfig);
-        }
-        self.wifi.ssid = value.into();
-        Ok(())
-    }
-
-    pub fn set_wifi_password(&mut self, value: &str) -> Result<(), ConfigError> {
-        if !(value.is_empty()
-            || (MIN_WIFI_PASSWORD_LEN..=MAX_WIFI_PASSWORD_LEN).contains(&value.len()))
-        {
-            return Err(ConfigError::InvalidWifiConfig);
-        }
-        self.wifi.password = value.into();
-        Ok(())
-    }
-
-    pub fn set_wifi_telnet(&mut self, enabled: bool) {
-        self.wifi.telnet = enabled;
-    }
-
-    #[cfg(feature = "mqtt")]
-    pub fn mqtt(&self, index: usize) -> Option<&MqttConfig> {
-        self.mqtt.get(index)
-    }
-
-    #[cfg(feature = "mqtt")]
-    pub fn set_mqtt_value(
-        &mut self,
-        index: usize,
-        key: &str,
-        value: &str,
-    ) -> Result<(), ConfigError> {
-        if value.len() > MAX_MQTT_VALUE_LEN {
-            return Err(ConfigError::InvalidMqttConfig);
-        }
-        let mqtt = self
-            .mqtt
-            .get_mut(index)
-            .ok_or(ConfigError::InvalidMqttConfig)?;
-        match key {
-            "host" => {
-                if !value.is_empty()
-                    && super::mqtt::transport::Endpoint::parse(value, mqtt.port).is_err()
-                {
-                    return Err(ConfigError::InvalidMqttConfig);
-                }
-                mqtt.host = value.into();
-            }
-            "port" => mqtt.port = value.parse().map_err(|_| ConfigError::InvalidMqttConfig)?,
-            "username" => mqtt.username = value.into(),
-            "password" => mqtt.password = value.into(),
-            "auth" => {
-                mqtt.auth =
-                    super::mqtt::AuthMode::parse(value).ok_or(ConfigError::InvalidMqttConfig)?
-            }
-            "auth.audience" | "audience" => mqtt.auth_audience = value.into(),
-            "topic.root" => mqtt.topic_root = value.into(),
-            "iata" => mqtt.iata = value.into(),
-            _ => return Err(ConfigError::InvalidMqttConfig),
-        }
-        Ok(())
+    pub fn extension_mut(&mut self) -> &mut C {
+        &mut self.extension
     }
 
     pub fn acl(&self) -> &super::acl::Acl {
@@ -297,29 +238,12 @@ impl AppConfig {
             StoredAppConfig::default_with_private_key(self.private_key),
             "generated",
         );
-        #[cfg(feature = "mqtt")]
-        if let Some(number) = setting.strip_prefix("mqtt.")
-            && !number.contains('.')
-        {
-            let index = number
-                .parse::<usize>()
-                .ok()
-                .and_then(|number| number.checked_sub(1))
-                .filter(|index| *index < MQTT_SERVER_COUNT)
-                .ok_or(ConfigError::UnknownSetting)?;
-            self.mqtt[index] = defaults.mqtt[index].clone();
-            return Ok(());
-        }
         match setting {
             "name" => self.node_name = defaults.node_name,
             "owner.info" => self.owner_info = defaults.owner_info,
             "password" => self.remote_cli_password = defaults.remote_cli_password,
             "lat" => self.latitude_microdegrees = defaults.latitude_microdegrees,
             "lon" => self.longitude_microdegrees = defaults.longitude_microdegrees,
-            "ntp" => self.ntp = defaults.ntp,
-            "wifi.ssid" => self.wifi.ssid = defaults.wifi.ssid,
-            "wifi.pass" => self.wifi.password = defaults.wifi.password,
-            "wifi.telnet" => self.wifi.telnet = defaults.wifi.telnet,
             "radio" => self.radio = defaults.radio,
             "freq" => self.radio.receive_frequency_hz = defaults.radio.receive_frequency_hz,
             "tx" => self.radio.transmit_power_dbm = defaults.radio.transmit_power_dbm,
@@ -333,7 +257,7 @@ impl AppConfig {
             }
             "loop.detect" => self.loop_detection = defaults.loop_detection,
             "path.hash.mode" => self.path_hash_mode = defaults.path_hash_mode,
-            _ => return Err(ConfigError::UnknownSetting),
+            _ => return self.extension.unset(setting, &defaults.extension),
         }
         Ok(())
     }
@@ -457,7 +381,7 @@ impl AppConfig {
     }
 
     pub fn remove_region(&mut self, name: &str) -> Result<(), ConfigError> {
-        let defaults = StoredAppConfig::default_with_private_key(self.private_key);
+        let defaults = StoredAppConfig::<C>::default_with_private_key(self.private_key);
         if let Some(region) = defaults.regions.find_by_name_prefix(name)
             && !region.is_wildcard()
             && region.display_name() == name.strip_prefix('#').unwrap_or(name)
@@ -556,8 +480,7 @@ impl RadioConfig {
             self.coding_rate_denominator,
             low_data_rate_optimize,
         );
-        let preamble_symbols_quarters =
-            crate::modules::sx1262::RECEIVE_PREAMBLE_LENGTH as u64 * 4 + 17;
+        let preamble_symbols_quarters = crate::radio::RECEIVE_PREAMBLE_LENGTH as u64 * 4 + 17;
         let preamble_us = div_ceil_u64(symbol_time_us * preamble_symbols_quarters, 4);
         let payload_us = payload_symbols as u64 * symbol_time_us;
 
@@ -593,20 +516,6 @@ impl RadioConfig {
             return Err(ConfigError::InvalidTransmitPower);
         }
         Ok(())
-    }
-
-    pub fn receive_config(self) -> crate::modules::sx1262::ReceiveConfig {
-        crate::modules::sx1262::ReceiveConfig {
-            frequency_hz: self.receive_frequency_hz,
-            spreading_factor: spreading_factor(self.spreading_factor),
-            bandwidth: bandwidth(self.bandwidth_hz),
-            coding_rate: coding_rate(self.coding_rate_denominator),
-            preamble_length: crate::modules::sx1262::RECEIVE_PREAMBLE_LENGTH,
-            max_payload_len: crate::modules::sx1262::RECEIVE_MAX_PAYLOAD_LEN,
-            crc_on: true,
-            iq_inverted: false,
-            transmit_output_power_dbm: self.transmit_power_dbm,
-        }
     }
 }
 
@@ -645,7 +554,7 @@ fn generated_node_name(private_key: PrivateKey) -> String {
 }
 
 #[derive(Clone)]
-struct StoredAppConfig {
+struct StoredAppConfig<C> {
     private_key: PrivateKey,
     latitude_microdegrees: Option<i32>,
     longitude_microdegrees: Option<i32>,
@@ -653,8 +562,6 @@ struct StoredAppConfig {
     owner_info: String,
     remote_cli_password: String,
     acl: super::acl::Acl,
-    ntp: String,
-    wifi: WifiConfig,
     radio: RadioConfig,
     regions: RegionMap,
     region_capture: bool,
@@ -666,17 +573,16 @@ struct StoredAppConfig {
     loop_detection: LoopDetection,
     path_hash_mode: u8,
     duty_cycle_percent: u8,
-    #[cfg(feature = "mqtt")]
-    mqtt: [MqttConfig; MQTT_SERVER_COUNT],
+    extension: C,
 }
 
-impl StoredAppConfig {
+impl<C: ExtensionConfig> StoredAppConfig<C> {
     fn default_with_identity_seed(identity_seed: [u8; 32]) -> Self {
         Self::default_with_private_key(PrivateKey::Seed(identity_seed))
     }
 
     fn default_with_private_key(private_key: PrivateKey) -> Self {
-        Self::with_defaults_text(private_key, super::PROFILE_CONFIG)
+        Self::with_defaults_text(private_key, PROFILE_CONFIG)
             .expect("invalid embedded defaults or profile")
     }
 
@@ -692,8 +598,6 @@ impl StoredAppConfig {
             owner_info: String::new(),
             remote_cli_password: String::new(),
             acl: super::acl::Acl::default(),
-            ntp: String::new(),
-            wifi: WifiConfig::default(),
             radio: RadioConfig {
                 receive_frequency_hz: 0,
                 spreading_factor: 0,
@@ -711,18 +615,17 @@ impl StoredAppConfig {
             loop_detection: LoopDetection::default(),
             path_hash_mode: 0,
             duty_cycle_percent: 0,
-            #[cfg(feature = "mqtt")]
-            mqtt: core::array::from_fn(|_| MqttConfig::default()),
+            extension: C::default(),
         };
         let defaults = decode_config_layer(
-            include_bytes!("../../../profiles/defaults.conf"),
+            include_bytes!("../../profiles/defaults.conf"),
             &empty,
             ConfigSource::Defaults,
         )?;
         decode_config_layer(overlay.as_bytes(), &defaults, ConfigSource::Profile)
     }
 
-    fn from_app_config(config: &AppConfig) -> Self {
+    fn from_app_config(config: &AppConfig<C>) -> Self {
         Self {
             private_key: config.private_key,
             latitude_microdegrees: config.latitude_microdegrees,
@@ -732,8 +635,6 @@ impl StoredAppConfig {
             owner_info: String::from(config.owner_info()),
             remote_cli_password: fit_password(config.remote_cli_password()),
             acl: config.acl.clone(),
-            ntp: config.ntp.clone(),
-            wifi: config.wifi.clone(),
             radio: config.radio,
             regions: config.regions.clone(),
             region_capture: config.region_capture,
@@ -745,18 +646,18 @@ impl StoredAppConfig {
             loop_detection: config.loop_detection,
             path_hash_mode: config.path_hash_mode,
             duty_cycle_percent: config.duty_cycle_percent,
-            #[cfg(feature = "mqtt")]
-            mqtt: config.mqtt.clone(),
+            extension: config.extension.clone(),
         }
     }
 }
 
-fn load_config_file<S>(
+fn load_config_file<S, C>(
     storage: &mut S,
-    defaults: &StoredAppConfig,
-) -> Option<(StoredAppConfig, bool)>
+    defaults: &StoredAppConfig<C>,
+) -> Option<(StoredAppConfig<C>, bool)>
 where
     S: crate::platform::storage::Storage,
+    C: ExtensionConfig,
 {
     let mut buffer = [0u8; APP_CONFIG_MAX_LEN];
     let len = storage.read(APP_CONFIG_KEY, &mut buffer).ok()?;
@@ -767,12 +668,13 @@ where
     Some((config, data != encoded.as_slice()))
 }
 
-fn write_config_file<S>(
+fn write_config_file<S, C>(
     storage: &mut S,
-    config: &StoredAppConfig,
+    config: &StoredAppConfig<C>,
 ) -> Result<(), crate::platform::storage::Error>
 where
     S: crate::platform::storage::Storage,
+    C: ExtensionConfig,
 {
     let data = encode_config_text(config);
     if data.len() > APP_CONFIG_MAX_LEN {
@@ -781,23 +683,35 @@ where
     storage.write_atomic(APP_CONFIG_KEY, &data)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConfigSource {
+/// The layer a setting is read from: the base defaults, the selected build
+/// profile, or the device's stored config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigSource {
     Defaults,
     Profile,
     Storage,
 }
 
-fn decode_config_text(data: &[u8], defaults: &StoredAppConfig) -> Option<StoredAppConfig> {
+impl ConfigSource {
+    /// Unknown settings are errors in build-time layers, and ignored in storage.
+    pub fn is_strict(self) -> bool {
+        self != Self::Storage
+    }
+}
+
+fn decode_config_text<C: ExtensionConfig>(
+    data: &[u8],
+    defaults: &StoredAppConfig<C>,
+) -> Option<StoredAppConfig<C>> {
     decode_config_layer(data, defaults, ConfigSource::Storage)
 }
 
-fn decode_config_layer(
+fn decode_config_layer<C: ExtensionConfig>(
     data: &[u8],
-    defaults: &StoredAppConfig,
+    defaults: &StoredAppConfig<C>,
     source: ConfigSource,
-) -> Option<StoredAppConfig> {
-    let strict = source != ConfigSource::Storage;
+) -> Option<StoredAppConfig<C>> {
+    let strict = source.is_strict();
     if strict && data.len() > APP_CONFIG_MAX_LEN {
         return None;
     }
@@ -854,33 +768,6 @@ fn decode_config_layer(
             "remote.password" => {
                 config.remote_cli_password = fit_password(&value);
             }
-            "ntp" => {
-                validate_ntp_host(&value).ok()?;
-                config.ntp = value;
-            }
-            "wifi.ssid" => config.wifi.ssid = value,
-            "wifi.pass" => config.wifi.password = value,
-            "wifi.telnet" => config.wifi.telnet = parse_bool(&value)?,
-            // The base file contains optional MQTT settings for all builds.
-            #[cfg(not(feature = "mqtt"))]
-            key if key.starts_with("mqtt.") && source == ConfigSource::Defaults => {}
-            #[cfg(feature = "mqtt")]
-            key if key.starts_with("mqtt.") => {
-                let (server, field) = parse_mqtt_key(key)?;
-                let mqtt = config.mqtt.get_mut(server)?;
-                match field {
-                    "host" => mqtt.host = value,
-                    "port" => mqtt.port = value.parse().ok()?,
-                    "username" => mqtt.username = value,
-                    "password" => mqtt.password = value,
-                    "auth" => mqtt.auth = super::mqtt::AuthMode::parse(&value)?,
-                    "auth.audience" | "audience" => mqtt.auth_audience = value,
-                    "topic.root" => mqtt.topic_root = value,
-                    "iata" => mqtt.iata = value,
-                    _ if strict => return None,
-                    _ => {}
-                }
-            }
             "radio.frequency_hz" => {
                 config.radio.receive_frequency_hz = value.parse::<u32>().ok()?;
             }
@@ -934,8 +821,12 @@ fn decode_config_layer(
                 let allowed = parse_bool(&value)?;
                 config.regions.set_region_from_config(name, allowed).ok()?;
             }
-            _ if strict => return None,
-            _ => {}
+            key => match config.extension.decode(key, value, source) {
+                Some(Ok(())) => {}
+                Some(Err(())) => return None,
+                None if strict => return None,
+                None => {}
+            },
         }
     }
 
@@ -952,65 +843,27 @@ fn decode_config_layer(
     validate_flood_max_hops(config.flood_max_unscoped_hops).ok()?;
     validate_flood_max_hops(config.flood_max_advert_hops).ok()?;
     validate_path_hash_mode(config.path_hash_mode).ok()?;
-    validate_wifi_config(&config.wifi).ok()?;
-    #[cfg(feature = "mqtt")]
-    for mqtt in &config.mqtt {
-        if !mqtt.host.is_empty()
-            && super::mqtt::transport::Endpoint::parse(&mqtt.host, mqtt.port).is_err()
-        {
-            return None;
-        }
-        if [
-            &mqtt.host,
-            &mqtt.username,
-            &mqtt.password,
-            &mqtt.auth_audience,
-            &mqtt.topic_root,
-            &mqtt.iata,
-        ]
-        .iter()
-        .any(|value| value.len() > MAX_MQTT_VALUE_LEN)
-        {
-            return None;
-        }
+    if !config.extension.validate() {
+        return None;
     }
     Some(config)
 }
 
-fn validate_ntp_host(host: &str) -> Result<(), ConfigError> {
-    if host.is_empty()
-        || host.len() > 253
-        || !host
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(ConfigError::InvalidNtpHost);
-    }
-    Ok(())
-}
-
-fn validate_wifi_config(wifi: &WifiConfig) -> Result<(), ConfigError> {
-    if wifi.ssid.len() > MAX_WIFI_SSID_LEN
-        || !(wifi.password.is_empty()
-            || (MIN_WIFI_PASSWORD_LEN..=MAX_WIFI_PASSWORD_LEN).contains(&wifi.password.len()))
-    {
-        return Err(ConfigError::InvalidWifiConfig);
-    }
-    Ok(())
-}
-
-fn encode_config_text(config: &StoredAppConfig) -> Vec<u8> {
+fn encode_config_text<C: ExtensionConfig>(config: &StoredAppConfig<C>) -> Vec<u8> {
     let defaults = StoredAppConfig::default_with_private_key(config.private_key);
     encode_sparse_config_text(config, &defaults)
 }
 
-fn encode_sparse_config_text(config: &StoredAppConfig, defaults: &StoredAppConfig) -> Vec<u8> {
+fn encode_sparse_config_text<C: ExtensionConfig>(
+    config: &StoredAppConfig<C>,
+    defaults: &StoredAppConfig<C>,
+) -> Vec<u8> {
     encode_sparse_config_text_redacted(config, defaults, false)
 }
 
-fn encode_sparse_config_text_redacted(
-    config: &StoredAppConfig,
-    defaults: &StoredAppConfig,
+fn encode_sparse_config_text_redacted<C: ExtensionConfig>(
+    config: &StoredAppConfig<C>,
+    defaults: &StoredAppConfig<C>,
     redact_secrets: bool,
 ) -> Vec<u8> {
     let mut out = String::new();
@@ -1062,28 +915,6 @@ fn encode_sparse_config_text_redacted(
             write_escaped_value(&mut out, &config.remote_cli_password);
         }
         out.push('\n');
-    }
-
-    if config.ntp != defaults.ntp {
-        let _ = writeln!(&mut out, "ntp={}", config.ntp);
-    }
-
-    if config.wifi.ssid != defaults.wifi.ssid {
-        out.push_str("wifi.ssid=");
-        write_escaped_value(&mut out, &config.wifi.ssid);
-        out.push('\n');
-    }
-    if config.wifi.password != defaults.wifi.password {
-        out.push_str("wifi.pass=");
-        if redact_secrets && !config.wifi.password.is_empty() {
-            out.push_str("<redacted>");
-        } else {
-            write_escaped_value(&mut out, &config.wifi.password);
-        }
-        out.push('\n');
-    }
-    if config.wifi.telnet != defaults.wifi.telnet {
-        let _ = writeln!(&mut out, "wifi.telnet={}", bool_text(config.wifi.telnet));
     }
 
     if config.radio.receive_frequency_hz != defaults.radio.receive_frequency_hz {
@@ -1171,26 +1002,22 @@ fn encode_sparse_config_text_redacted(
     if config.loop_detection != defaults.loop_detection {
         let _ = writeln!(&mut out, "loop.detect={}", config.loop_detection.as_str());
     }
-    #[cfg(feature = "mqtt")]
-    for (index, mqtt) in config.mqtt.iter().enumerate() {
-        write_mqtt_config(
-            &mut out,
-            index,
-            mqtt,
-            Some(&defaults.mqtt[index]),
-            redact_secrets,
-        );
-    }
+    config
+        .extension
+        .encode_changed(&defaults.extension, redact_secrets, &mut out);
 
     out.into_bytes()
 }
 
-fn encode_full_config_text_redacted(config: &StoredAppConfig, redact_secrets: bool) -> Vec<u8> {
+fn encode_full_config_text_redacted<C: ExtensionConfig>(
+    config: &StoredAppConfig<C>,
+    redact_secrets: bool,
+) -> Vec<u8> {
     let mut out = String::new();
     let _ = writeln!(&mut out, "# MCRS app.conf");
     let _ = writeln!(&mut out, "version={}", APP_CONFIG_TEXT_VERSION);
 
-    let defaults = StoredAppConfig::default_with_private_key(config.private_key);
+    let defaults = StoredAppConfig::<C>::default_with_private_key(config.private_key);
     config.acl.write_overrides(&defaults.acl, &mut out);
 
     out.push_str(config.private_key.config_key());
@@ -1203,19 +1030,6 @@ fn encode_full_config_text_redacted(config: &StoredAppConfig, redact_secrets: bo
         }
     }
     out.push('\n');
-
-    let _ = writeln!(&mut out, "ntp={}", config.ntp);
-    out.push_str("wifi.ssid=");
-    write_escaped_value(&mut out, &config.wifi.ssid);
-    out.push('\n');
-    if redact_secrets && !config.wifi.password.is_empty() {
-        out.push_str("wifi.pass=<redacted>\n");
-    } else {
-        out.push_str("wifi.pass=");
-        write_escaped_value(&mut out, &config.wifi.password);
-        out.push('\n');
-    }
-    let _ = writeln!(&mut out, "wifi.telnet={}", bool_text(config.wifi.telnet));
 
     out.push_str("identity.lat=");
     write_optional_coordinate(&mut out, config.latitude_microdegrees);
@@ -1296,90 +1110,9 @@ fn encode_full_config_text_redacted(config: &StoredAppConfig, redact_secrets: bo
     );
     let _ = writeln!(&mut out, "path.hash.mode={}", config.path_hash_mode);
     let _ = writeln!(&mut out, "loop.detect={}", config.loop_detection.as_str());
-    #[cfg(feature = "mqtt")]
-    for (index, mqtt) in config.mqtt.iter().enumerate() {
-        write_mqtt_config(&mut out, index, mqtt, None, redact_secrets);
-    }
+    config.extension.encode_all(redact_secrets, &mut out);
 
     out.into_bytes()
-}
-
-#[cfg(feature = "mqtt")]
-fn parse_mqtt_key(key: &str) -> Option<(usize, &str)> {
-    let key = key.strip_prefix("mqtt.")?;
-    let (number, field) = key.split_once('.')?;
-    let index = number.parse::<usize>().ok()?.checked_sub(1)?;
-    (index < MQTT_SERVER_COUNT).then_some((index, field))
-}
-
-#[cfg(feature = "mqtt")]
-fn write_mqtt_config(
-    out: &mut String,
-    index: usize,
-    mqtt: &MqttConfig,
-    defaults: Option<&MqttConfig>,
-    redact: bool,
-) {
-    let prefix = index + 1;
-    let values = [
-        (
-            "host",
-            mqtt.host.as_str(),
-            defaults.map(|d| d.host.as_str()),
-            false,
-        ),
-        (
-            "username",
-            mqtt.username.as_str(),
-            defaults.map(|d| d.username.as_str()),
-            false,
-        ),
-        (
-            "password",
-            mqtt.password.as_str(),
-            defaults.map(|d| d.password.as_str()),
-            true,
-        ),
-        (
-            "auth",
-            mqtt.auth.as_str(),
-            defaults.map(|d| d.auth.as_str()),
-            false,
-        ),
-        (
-            "auth.audience",
-            mqtt.auth_audience.as_str(),
-            defaults.map(|d| d.auth_audience.as_str()),
-            false,
-        ),
-        (
-            "topic.root",
-            mqtt.topic_root.as_str(),
-            defaults.map(|d| d.topic_root.as_str()),
-            false,
-        ),
-        (
-            "iata",
-            mqtt.iata.as_str(),
-            defaults.map(|d| d.iata.as_str()),
-            false,
-        ),
-    ];
-    for (key, value, default, secret) in values {
-        if default == Some(value) {
-            continue;
-        }
-        let _ = write!(out, "mqtt.{prefix}.{key}=");
-        if redact && secret && !value.is_empty() {
-            out.push_str("<redacted>");
-        } else {
-            write_escaped_value(out, value);
-        }
-        out.push('\n');
-    }
-    if defaults.is_none_or(|default| default.port != mqtt.port) {
-        let _ = writeln!(out, "mqtt.{prefix}.port={}", mqtt.port);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1397,12 +1130,10 @@ pub enum ConfigError {
     InvalidDutyCycle,
     InvalidFloodMaxHops,
     InvalidPathHashMode,
-    InvalidNtpHost,
-    InvalidWifiConfig,
-    #[cfg(feature = "mqtt")]
-    InvalidMqttConfig,
     InheritedRegion,
     Region(RegionError),
+    /// An invalid extension setting, with its message.
+    Extension(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -1421,14 +1152,11 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidDutyCycle => f.write_str("invalid duty cycle"),
             ConfigError::InvalidFloodMaxHops => f.write_str("invalid flood max hops"),
             ConfigError::InvalidPathHashMode => f.write_str("invalid path hash mode"),
-            ConfigError::InvalidNtpHost => f.write_str("invalid NTP host"),
-            ConfigError::InvalidWifiConfig => f.write_str("invalid Wi-Fi setting"),
-            #[cfg(feature = "mqtt")]
-            ConfigError::InvalidMqttConfig => f.write_str("invalid MQTT setting"),
             ConfigError::InheritedRegion => {
                 f.write_str("inherited region cannot be removed; use region denyf")
             }
             ConfigError::Region(error) => write!(f, "region: {}", error),
+            ConfigError::Extension(message) => f.write_str(message),
         }
     }
 }
@@ -1491,7 +1219,8 @@ fn fit_password(input: &str) -> String {
     output
 }
 
-fn write_escaped_value(out: &mut String, value: &str) {
+/// Writes a config value, escaping the characters that would end its line.
+pub fn write_escaped_value(out: &mut String, value: &str) {
     for character in value.chars() {
         match character {
             '\\' => out.push_str("\\\\"),
@@ -1543,7 +1272,7 @@ pub fn repeat_text(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
 }
 
-fn parse_bool(input: &str) -> Option<bool> {
+pub fn parse_bool(input: &str) -> Option<bool> {
     match input.trim() {
         "true" | "yes" | "on" | "1" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
@@ -1563,7 +1292,7 @@ pub fn parse_path_hash_mode(input: &str) -> Option<u8> {
     Some(mode)
 }
 
-fn bool_text(value: bool) -> &'static str {
+pub fn bool_text(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
@@ -1693,62 +1422,28 @@ fn write_optional_coordinate(out: &mut String, coordinate_microdegrees: Option<i
     let _ = write!(out, "{}.{:06}", whole, fraction);
 }
 
-fn spreading_factor(value: u8) -> lora_phy::mod_params::SpreadingFactor {
-    match value {
-        5 => lora_phy::mod_params::SpreadingFactor::_5,
-        6 => lora_phy::mod_params::SpreadingFactor::_6,
-        7 => lora_phy::mod_params::SpreadingFactor::_7,
-        9 => lora_phy::mod_params::SpreadingFactor::_9,
-        10 => lora_phy::mod_params::SpreadingFactor::_10,
-        11 => lora_phy::mod_params::SpreadingFactor::_11,
-        12 => lora_phy::mod_params::SpreadingFactor::_12,
-        _ => lora_phy::mod_params::SpreadingFactor::_8,
-    }
-}
-
-fn bandwidth(value: u32) -> lora_phy::mod_params::Bandwidth {
-    match value {
-        7_810 => lora_phy::mod_params::Bandwidth::_7KHz,
-        10_420 => lora_phy::mod_params::Bandwidth::_10KHz,
-        15_630 => lora_phy::mod_params::Bandwidth::_15KHz,
-        20_830 => lora_phy::mod_params::Bandwidth::_20KHz,
-        31_250 => lora_phy::mod_params::Bandwidth::_31KHz,
-        41_670 => lora_phy::mod_params::Bandwidth::_41KHz,
-        125_000 => lora_phy::mod_params::Bandwidth::_125KHz,
-        250_000 => lora_phy::mod_params::Bandwidth::_250KHz,
-        500_000 => lora_phy::mod_params::Bandwidth::_500KHz,
-        _ => lora_phy::mod_params::Bandwidth::_62KHz,
-    }
-}
-
-fn coding_rate(value: u8) -> lora_phy::mod_params::CodingRate {
-    match value {
-        5 => lora_phy::mod_params::CodingRate::_4_5,
-        6 => lora_phy::mod_params::CodingRate::_4_6,
-        7 => lora_phy::mod_params::CodingRate::_4_7,
-        _ => lora_phy::mod_params::CodingRate::_4_8,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn defaults() -> StoredAppConfig {
+    fn defaults() -> StoredAppConfig<()> {
         StoredAppConfig::default_with_identity_seed([7; 32])
     }
 
-    fn network_defaults(text: &str) -> StoredAppConfig {
+    fn network_defaults(text: &str) -> StoredAppConfig<()> {
         StoredAppConfig::with_defaults_text(PrivateKey::Seed([7; 32]), text).unwrap()
     }
 
+    fn generated_defaults(seed: [u8; 32]) -> AppConfig<()> {
+        AppConfig::generated_defaults(seed)
+    }
+
     #[test]
-    fn embedded_defaults_and_selected_profile_are_valid() {
-        #[cfg(mcrs_profile)]
-        let profile = include_str!(env!("MCRS_PROFILE_PATH"));
-        #[cfg(not(mcrs_profile))]
-        let profile = "";
-        assert!(StoredAppConfig::with_defaults_text(PrivateKey::Seed([7; 32]), profile).is_some());
+    fn embedded_defaults_are_valid() {
+        // Profiles may set extension settings, so firmware checks the selected profile.
+        assert!(
+            StoredAppConfig::<()>::with_defaults_text(PrivateKey::Seed([7; 32]), "").is_some()
+        );
     }
 
     #[test]
@@ -1936,7 +1631,7 @@ mod tests {
     #[test]
     fn delta_export_compares_profile_defaults_and_redacts_changed_secrets() {
         let image = network_defaults(
-            "node.name=Profile repeater\nflood.max.advert=7\nremote.password=profile-secret\nwifi.pass=profile-wifi\n",
+            "node.name=Profile repeater\nflood.max.advert=7\nremote.password=profile-secret\n",
         );
         let unchanged = encode_sparse_config_text_redacted(&image, &image, true);
         assert_eq!(
@@ -1944,18 +1639,17 @@ mod tests {
             "# MCRS app.conf\nversion=1\n"
         );
         let device = decode_config_text(
-            b"node.name=My repeater\nflood.max.advert=3\nremote.password=device-secret\nwifi.pass=device-wifi\n",
+            b"node.name=My repeater\nflood.max.advert=3\nremote.password=device-secret\n",
             &image,
-        ).unwrap();
+        )
+        .unwrap();
         let delta = encode_sparse_config_text_redacted(&device, &image, true);
         let delta = core::str::from_utf8(&delta).unwrap();
         assert!(delta.contains("node.name=My repeater\n"));
         // The base default still counts as a change when the profile differs.
         assert!(delta.contains("flood.max.advert=3\n"));
         assert!(delta.contains("remote.password=<redacted>\n"));
-        assert!(delta.contains("wifi.pass=<redacted>\n"));
         assert!(!delta.contains("device-secret"));
-        assert!(!delta.contains("device-wifi"));
         assert!(!delta.contains("identity.seed="));
         assert!(!delta.contains("identity.expanded="));
         assert!(!delta.contains("radio.frequency_hz="));
@@ -1964,26 +1658,6 @@ mod tests {
         let loaded = decode_config_text(&saved, &image).unwrap();
         assert_eq!(loaded.private_key, device.private_key);
         assert_eq!(loaded.remote_cli_password, device.remote_cli_password);
-        assert_eq!(loaded.wifi.password, device.wifi.password);
-    }
-
-    #[cfg(feature = "mqtt")]
-    #[test]
-    fn delta_export_redacts_only_changed_mqtt_passwords() {
-        let image = network_defaults("mqtt.1.password=profile-secret\n");
-        let device = decode_config_text(b"mqtt.1.password=device-secret\n", &image).unwrap();
-        let delta = encode_sparse_config_text_redacted(&device, &image, true);
-        let delta = core::str::from_utf8(&delta).unwrap();
-        assert!(delta.contains("mqtt.1.password=<redacted>\n"));
-        assert!(!delta.contains("device-secret"));
-        assert!(!delta.contains("mqtt.2.password="));
-        let cleared = decode_config_text(b"mqtt.1.password=\n", &image).unwrap();
-        let delta = encode_sparse_config_text_redacted(&cleared, &image, true);
-        assert!(
-            core::str::from_utf8(&delta)
-                .unwrap()
-                .contains("mqtt.1.password=\n")
-        );
     }
 
     #[test]
@@ -2050,14 +1724,15 @@ mod tests {
             alloc::format!("identity.seed={}", "00".repeat(32)),
         ] {
             assert!(
-                StoredAppConfig::with_defaults_text(PrivateKey::Seed([7; 32]), &text).is_none()
+                StoredAppConfig::<()>::with_defaults_text(PrivateKey::Seed([7; 32]), &text)
+                    .is_none()
             );
         }
     }
 
     #[test]
     fn loop_detection_defaults_round_trips_and_resets() {
-        let mut config = AppConfig::generated_defaults([7; 32]);
+        let mut config = generated_defaults([7; 32]);
         assert_eq!(config.loop_detection(), LoopDetection::Minimal);
         let legacy = decode_config_text(b"version=1\n", &defaults()).unwrap();
         assert_eq!(legacy.loop_detection, LoopDetection::Minimal);
@@ -2093,7 +1768,7 @@ mod tests {
 
     #[test]
     fn owner_info_round_trips_and_clears() {
-        let mut config = AppConfig::generated_defaults([7; 32]);
+        let mut config = generated_defaults([7; 32]);
         assert_eq!(config.owner_info(), "");
         config.set_owner_info("Alice|alice@example.org|Back\\yard");
         let stored = StoredAppConfig::from_app_config(&config);
@@ -2131,130 +1806,6 @@ mod tests {
         assert_eq!(fit_owner_info("Alice\0ignored"), "Alice");
     }
 
-    #[test]
-    fn ntp_override_round_trips_and_resets() {
-        let mut config = AppConfig::generated_defaults([7; 32]);
-        assert_eq!(config.ntp(), "pool.ntp.org");
-        for host in ["time.example.net", "192.0.2.1"] {
-            config.set_ntp(host).unwrap();
-            let stored = StoredAppConfig::from_app_config(&config);
-            let encoded = encode_config_text(&stored);
-            let decoded = decode_config_text(&encoded, &defaults()).unwrap();
-            assert_eq!(decoded.ntp, host);
-            assert!(
-                core::str::from_utf8(&encode_full_config_text_redacted(&stored, true))
-                    .unwrap()
-                    .contains(&alloc::format!("ntp={host}\n"))
-            );
-        }
-        for host in [
-            "",
-            "time.example.net:123",
-            "https://time.example.net",
-            "a b",
-            "a\nb",
-        ] {
-            assert_eq!(config.set_ntp(host), Err(ConfigError::InvalidNtpHost));
-        }
-        config.unset("ntp").unwrap();
-        assert_eq!(config.ntp(), "pool.ntp.org");
-        assert!(
-            !core::str::from_utf8(&encode_config_text(&StoredAppConfig::from_app_config(
-                &config
-            )))
-            .unwrap()
-            .contains("ntp=")
-        );
-    }
-
-    #[test]
-    fn wifi_config_round_trips_escaped_values() {
-        let mut config = defaults();
-        config.wifi.ssid = String::from("lab\\network\nwest");
-        config.wifi.password = String::from("password\\with\\slashes");
-        let encoded = encode_config_text(&config);
-        let decoded = decode_config_text(&encoded, &defaults()).expect("valid config");
-        assert_eq!(decoded.wifi, config.wifi);
-    }
-
-    #[test]
-    fn wifi_password_is_redacted_from_effective_config() {
-        let mut config = defaults();
-        config.wifi.ssid = String::from("lab");
-        config.wifi.password = String::from("supersecret");
-        let rendered = encode_full_config_text_redacted(&config, true);
-        let rendered = core::str::from_utf8(&rendered).expect("UTF-8 config");
-        assert!(rendered.contains("wifi.pass=<redacted>"));
-        assert!(!rendered.contains("supersecret"));
-    }
-
-    #[test]
-    fn empty_wifi_password_round_trips() {
-        let mut config = defaults();
-        config.wifi.ssid = String::from("open-network");
-        let encoded = encode_config_text(&config);
-        let decoded = decode_config_text(&encoded, &defaults()).expect("valid config");
-        assert_eq!(decoded.wifi.password(), "");
-    }
-
-    #[test]
-    fn wifi_telnet_round_trips() {
-        let mut config = defaults();
-        config.wifi.telnet = true;
-        let encoded = encode_config_text(&config);
-        let decoded = decode_config_text(&encoded, &defaults()).expect("valid config");
-        assert!(decoded.wifi.telnet());
-    }
-
-    #[test]
-    fn unset_restores_default_and_removes_sparse_override() {
-        let mut config = AppConfig::generated_defaults([7; 32]);
-        config.set_wifi_telnet(true);
-        config.unset("wifi.telnet").expect("known setting");
-
-        assert!(!config.wifi().telnet());
-        let stored = StoredAppConfig::from_app_config(&config);
-        let rendered = encode_config_text(&stored);
-        let rendered = core::str::from_utf8(&rendered).expect("UTF-8 config");
-        assert!(!rendered.contains("wifi.telnet="));
-    }
-
-    #[test]
-    fn wifi_lengths_are_validated() {
-        let mut config = AppConfig::generated_defaults([9; 32]);
-        assert!(config.set_wifi_ssid(&"x".repeat(MAX_WIFI_SSID_LEN)).is_ok());
-        assert!(
-            config
-                .set_wifi_ssid(&"x".repeat(MAX_WIFI_SSID_LEN + 1))
-                .is_err()
-        );
-        assert!(config.set_wifi_password("").is_ok());
-        assert!(config.set_wifi_password("12345678").is_ok());
-        assert!(config.set_wifi_password("short").is_err());
-        assert!(
-            config
-                .set_wifi_password(&"x".repeat(MAX_WIFI_PASSWORD_LEN + 1))
-                .is_err()
-        );
-    }
-
-    #[cfg(feature = "mqtt")]
-    #[test]
-    fn unset_mqtt_server_restores_all_defaults() {
-        let mut config = AppConfig::generated_defaults([11; 32]);
-        config.set_mqtt_value(0, "host", "broker.example").unwrap();
-        config.set_mqtt_value(0, "port", "2883").unwrap();
-        config.set_mqtt_value(0, "password", "secret").unwrap();
-
-        config.unset("mqtt.1").expect("known MQTT server");
-
-        assert_eq!(
-            config.mqtt(0),
-            AppConfig::generated_defaults([11; 32]).mqtt(0)
-        );
-        assert!(config.unset("mqtt.0").is_err());
-        assert!(config.unset("mqtt.4").is_err());
-    }
     fn expanded_key() -> PrivateKey {
         PrivateKey::from_hex("28ad39fefd7fa3e200a9c626eef599e61a2d055c48a8288a4e7e4c4bca3928789c7d6db3506d65dbac7c052aaee4857425210c9bc54030c826e54055983452a5").unwrap()
     }
@@ -2262,7 +1813,7 @@ mod tests {
     #[test]
     fn private_key_formats_round_trip_and_redact() {
         for key in [PrivateKey::Seed([7; 32]), expanded_key()] {
-            let stored = StoredAppConfig::default_with_private_key(key);
+            let stored = StoredAppConfig::<()>::default_with_private_key(key);
             let encoded = encode_config_text(&stored);
             let text = core::str::from_utf8(&encoded).unwrap();
             assert!(text.contains(key.config_key()));
@@ -2282,7 +1833,7 @@ mod tests {
 
     #[test]
     fn importing_key_keeps_active_identity_until_reload() {
-        let mut config = AppConfig::generated_defaults([9; 32]);
+        let mut config = generated_defaults([9; 32]);
         let original_public = *config.identity().public_key();
         let original_signature = config.identity().sign(b"advert");
         config.set_private_key(expanded_key());
@@ -2304,8 +1855,9 @@ mod tests {
 
     #[test]
     fn rejects_keys_with_wrong_config_format() {
-        let expanded =
-            encode_config_text(&StoredAppConfig::default_with_private_key(expanded_key()));
+        let expanded = encode_config_text(&StoredAppConfig::<()>::default_with_private_key(
+            expanded_key(),
+        ));
         let wrong = core::str::from_utf8(&expanded)
             .unwrap()
             .replace("identity.expanded=", "identity.seed=");
@@ -2316,9 +1868,10 @@ mod tests {
             .replace("identity.seed=", "identity.expanded=");
         assert!(decode_config_text(wrong.as_bytes(), &defaults()).is_none());
     }
+
     #[test]
     fn replacing_private_key_only_persists_the_selected_format() {
-        let mut config = AppConfig::generated_defaults([9; 32]);
+        let mut config = generated_defaults([9; 32]);
         for key in [expanded_key(), PrivateKey::Seed([7; 32])] {
             config.set_private_key(key);
             let encoded = encode_config_text(&StoredAppConfig::from_app_config(&config));
@@ -2337,5 +1890,124 @@ mod tests {
                 key
             );
         }
+    }
+
+    /// A stand-in for firmware settings with a secret and a flag.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct TestExtension {
+        token: String,
+        enabled: bool,
+    }
+
+    impl ExtensionConfig for TestExtension {
+        fn decode(
+            &mut self,
+            key: &str,
+            value: String,
+            source: ConfigSource,
+        ) -> Option<Result<(), ()>> {
+            match key {
+                "test.token" => self.token = value,
+                "test.enabled" => match parse_bool(&value) {
+                    Some(enabled) => self.enabled = enabled,
+                    None => return Some(Err(())),
+                },
+                _ if source == ConfigSource::Defaults => {}
+                _ => return None,
+            }
+            Some(Ok(()))
+        }
+
+        fn validate(&self) -> bool {
+            self.token != "invalid"
+        }
+
+        fn encode_changed(&self, defaults: &Self, redact_secrets: bool, out: &mut String) {
+            if self.token != defaults.token {
+                out.push_str("test.token=");
+                if redact_secrets {
+                    out.push_str("<redacted>");
+                } else {
+                    write_escaped_value(out, &self.token);
+                }
+                out.push('\n');
+            }
+            if self.enabled != defaults.enabled {
+                let _ = writeln!(out, "test.enabled={}", bool_text(self.enabled));
+            }
+        }
+
+        fn encode_all(&self, redact_secrets: bool, out: &mut String) {
+            out.push_str("test.token=");
+            if redact_secrets {
+                out.push_str("<redacted>");
+            } else {
+                write_escaped_value(out, &self.token);
+            }
+            out.push('\n');
+            let _ = writeln!(out, "test.enabled={}", bool_text(self.enabled));
+        }
+
+        fn unset(&mut self, setting: &str, defaults: &Self) -> Result<(), ConfigError> {
+            match setting {
+                "test.token" => self.token = defaults.token.clone(),
+                "test.enabled" => self.enabled = defaults.enabled,
+                _ => return Err(ConfigError::UnknownSetting),
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn extension_settings_are_layered_saved_and_reset() {
+        let image = StoredAppConfig::<TestExtension>::with_defaults_text(
+            PrivateKey::Seed([7; 32]),
+            "test.enabled=true\n",
+        )
+        .unwrap();
+        assert!(image.extension.enabled);
+        // Unknown profile settings are still rejected, and invalid values fail the layer.
+        for profile in ["test.typo=1\n", "test.enabled=maybe\n", "test.token=invalid\n"] {
+            assert!(
+                StoredAppConfig::<TestExtension>::with_defaults_text(
+                    PrivateKey::Seed([7; 32]),
+                    profile
+                )
+                .is_none()
+            );
+        }
+        // Stored settings from removed features are ignored rather than rejected.
+        let device = decode_config_text(
+            b"test.token=line\\nbreak\ntest.enabled=false\nold.feature=1\n",
+            &image,
+        )
+        .unwrap();
+        assert_eq!(device.extension.token, "line\nbreak");
+        assert!(!device.extension.enabled);
+
+        let saved = encode_sparse_config_text(&device, &image);
+        let text = core::str::from_utf8(&saved).unwrap();
+        assert!(text.contains("test.token=line\\nbreak\n"));
+        assert!(text.contains("test.enabled=false\n"));
+        assert!(!text.contains("old.feature"));
+        assert_eq!(
+            decode_config_text(&saved, &image).unwrap().extension,
+            device.extension
+        );
+        let delta = encode_sparse_config_text_redacted(&device, &image, true);
+        assert!(
+            core::str::from_utf8(&delta)
+                .unwrap()
+                .contains("test.token=<redacted>\n")
+        );
+        let full = encode_full_config_text_redacted(&device, true);
+        let full = core::str::from_utf8(&full).unwrap();
+        assert!(full.contains("test.token=<redacted>\ntest.enabled=false\n"));
+        assert!(!full.contains("break"));
+
+        let mut app = AppConfig::from_stored(device, "test");
+        app.unset("test.token").unwrap();
+        assert_eq!(app.extension().token, "");
+        assert_eq!(app.unset("test.typo"), Err(ConfigError::UnknownSetting));
     }
 }

@@ -136,7 +136,12 @@ async fn init(mut platform: crate::platform::Platform) -> ! {
     let mut storage = crate::platform::init_storage(crate::board::STORAGE_LAYOUT);
     let defaults = crate::app::config::AppConfig::generated_defaults(identity_seed);
     let config = crate::app::config::AppConfig::load_or_create(&mut storage, defaults);
-    let context = crate::app::AppContext::new(config, storage, crate::board::MEMORY_PROFILE);
+    let context = crate::app::AppContext::new(
+        config,
+        storage,
+        crate::board::MEMORY_PROFILE,
+        crate::app::Network::new(),
+    );
     heltec::log_memory_profile(crate::board::MEMORY_PROFILE);
     heltec::log_effective_config(&context).await;
     heltec::publish_battery_sample(&mut battery, &context).await;

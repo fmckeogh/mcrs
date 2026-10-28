@@ -1,178 +1,67 @@
-pub(crate) mod acl;
-pub mod cli;
-pub mod config;
-mod crypto;
-pub(crate) mod discovery;
-pub mod identity;
+//! The repeater, with Wi-Fi, OTA updates and optional MQTT reporting layered on top.
+pub mod ota;
+pub mod telnet;
 
 #[cfg(feature = "mqtt")]
 pub use mcrs_firmware::mqtt;
-mod neighbours;
-pub mod ota;
-pub mod periodic;
-mod protocol_log;
-pub mod regions;
-mod remote;
-pub mod telnet;
+pub use mcrs_repeater::{cli, discovery, handler_loop, periodic, radio_loop};
 
-use alloc::{string::String, vec::Vec};
+pub mod config {
+    #[cfg(feature = "mqtt")]
+    pub use mcrs_firmware::{mqtt::MqttConfig, network::MQTT_SERVER_COUNT};
+
+    pub type AppConfig = mcrs_repeater::config::AppConfig<mcrs_firmware::network::NetworkConfig>;
+}
+
+use alloc::{format, string::String};
+#[cfg(feature = "mqtt")]
+use core::{fmt::Write as _, sync::atomic::AtomicU8, sync::atomic::Ordering};
 use core::{
     cell::{Cell, RefCell},
-    fmt,
-    future::{Future, poll_fn},
-    pin::pin,
-    sync::atomic::{AtomicI16, AtomicU8, AtomicU16, AtomicU32, Ordering},
-    task::{Poll, Waker},
+    task::Waker,
 };
-use embassy_sync::{
-    blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex},
-    channel::Channel,
-    mutex::Mutex,
-    signal::Signal,
+#[cfg(feature = "mqtt")]
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+#[cfg(feature = "mqtt")]
+use mcrs_firmware::network::{MQTT_SERVER_COUNT, parse_mqtt_key};
+use mcrs_firmware::network::NetworkConfig;
+use mcrs_repeater::{
+    ConfigUpdateError,
+    cli::{CliRequest, denied_text},
+    config::ConfigError,
 };
-use embedded_hal_async::delay::DelayNs;
-use mcrs_protocol::{HashSize, Packet, Path, PayloadKind, RoutePath, RouteType, SeenPacketCache};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LoopDetection {
-    Off,
-    #[default]
-    Minimal,
-    Moderate,
-    Strict,
-}
+use crate::platform::storage::Storage;
 
-impl LoopDetection {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "off" => Some(Self::Off),
-            "minimal" => Some(Self::Minimal),
-            "moderate" => Some(Self::Moderate),
-            "strict" => Some(Self::Strict),
-            _ => None,
-        }
-    }
+pub type AppContext<S> = mcrs_repeater::AppContext<S, Network>;
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Minimal => "minimal",
-            Self::Moderate => "moderate",
-            Self::Strict => "strict",
-        }
-    }
-
-    pub fn detects_loop(self, path: &Path, node_hash: &[u8]) -> bool {
-        // Match upstream's own-prefix occurrence thresholds. Shorter prefixes
-        // allow more matches in minimal/moderate mode to tolerate collisions.
-        let threshold = match (self, path.hash_size()) {
-            (Self::Off, _) => return false,
-            (Self::Minimal, HashSize::One) => 4,
-            (Self::Minimal, HashSize::Two) => 2,
-            (Self::Moderate, HashSize::One) => 2,
-            _ => 1,
-        };
-        path.hashes()
-            .filter(|hash| node_hash.starts_with(hash))
-            .count()
-            >= threshold
-    }
-}
-
-#[cfg(mcrs_profile)]
-const PROFILE_CONFIG: &str = include_str!(env!("MCRS_PROFILE_PATH"));
-#[cfg(not(mcrs_profile))]
-const PROFILE_CONFIG: &str = "";
-
-const RECEIVE_BUFFER_LEN: usize = 255;
-const FORWARD_BUFFER_LEN: usize = 255;
-const INBOUND_QUEUE_CAPACITY: usize = 8;
-const OUTBOUND_QUEUE_CAPACITY: usize = 16;
-const SEEN_PACKET_TTL_MS: u64 = 15_000;
-const FORWARD_DELAY_BASE_MS: u32 = 40;
-const FORWARD_DELAY_JITTER_MS: u32 = 120;
-const OUTBOUND_MAX_ATTEMPTS: u8 = 5;
-const OUTBOUND_RETRY_DELAY_MIN_MS: u32 = 50;
-const OUTBOUND_RETRY_DELAY_MAX_MS: u32 = 500;
-const CAD_MAX_ATTEMPTS: usize = 16;
-const CAD_BUSY_BACKOFF_BASE_MS: u32 = 10;
-const CAD_BUSY_BACKOFF_AIRTIME_DIVISOR: u32 = 2;
-const CAD_BUSY_BACKOFF_SYMBOLS: u32 = 4;
-const DUTY_CYCLE_WINDOW_MS: u64 = 3_600_000;
-const BATTERY_LEVEL_UNKNOWN: u8 = u8::MAX;
-const BATTERY_MILLIVOLTS_UNKNOWN: u16 = u16::MAX;
-
-type AppMutex<T> = Mutex<CriticalSectionRawMutex, T>;
-
-pub struct AppContext<S>
-where
-    S: crate::platform::storage::Storage,
-{
-    config: AppMutex<config::AppConfig>,
-    storage: AppMutex<S>,
-    memory: crate::memory::MemoryProfile,
-    neighbours: AppMutex<neighbours::NeighbourTable>,
-    remote_logins: AppMutex<remote::RemoteLoginTable>,
-    inbound: Channel<CriticalSectionRawMutex, RxEvent, INBOUND_QUEUE_CAPACITY>,
-    outbound: SortedOutboundChannel,
-    #[cfg(feature = "mqtt")]
-    mqtt: [Channel<CriticalSectionRawMutex, mqtt::PacketEvent, 8>; config::MQTT_SERVER_COUNT],
+/// Network state shared between the CLI and the Wi-Fi tasks.
+pub struct Network {
     ota_requested: Cell<bool>,
     ota_address: Cell<Option<core::net::SocketAddrV4>>,
     ota_waker: RefCell<Option<Waker>>,
     ota_generation: Cell<u32>,
     #[cfg(feature = "mqtt")]
+    mqtt: [Channel<CriticalSectionRawMutex, mqtt::PacketEvent, 8>; MQTT_SERVER_COUNT],
+    #[cfg(feature = "mqtt")]
     mqtt_generation: Cell<u32>,
     #[cfg(feature = "mqtt")]
-    mqtt_wakers: [RefCell<Option<Waker>>; config::MQTT_SERVER_COUNT],
+    mqtt_wakers: [RefCell<Option<Waker>>; MQTT_SERVER_COUNT],
     #[cfg(feature = "mqtt")]
-    mqtt_states: [AtomicU8; config::MQTT_SERVER_COUNT],
+    mqtt_states: [AtomicU8; MQTT_SERVER_COUNT],
     #[cfg(feature = "mqtt")]
-    mqtt_errors: [Cell<Option<mqtt::ConnectionError>>; config::MQTT_SERVER_COUNT],
-    reboot_after_next_remote_reply: Cell<bool>,
-    seen_packets: RefCell<SeenPacketCache>,
-    pending_forwards: RefCell<Vec<[u8; 8]>>,
-    pending_discover: RefCell<Option<PendingDiscover>>,
-    started_at_ms: u64,
-    sent_direct: AtomicU32,
-    sent_flood: AtomicU32,
-    received_direct: AtomicU32,
-    received_flood: AtomicU32,
-    duplicates_direct: AtomicU32,
-    duplicates_flood: AtomicU32,
-    packets_received: AtomicU32,
-    packets_sent: AtomicU32,
-    tx_airtime_ms: AtomicU32,
-    packet_errors: AtomicU32,
-    battery_level_percent: AtomicU8,
-    battery_millivolts: AtomicU16,
-    last_rssi: AtomicI16,
-    last_snr_quarters: AtomicI16,
+    mqtt_errors: [Cell<Option<mqtt::ConnectionError>>; MQTT_SERVER_COUNT],
 }
 
-impl<S> AppContext<S>
-where
-    S: crate::platform::storage::Storage,
-{
-    pub fn new(
-        config: config::AppConfig,
-        storage: S,
-        memory: crate::memory::MemoryProfile,
-    ) -> Self {
+impl Network {
+    pub fn new() -> Self {
         Self {
-            config: Mutex::new(config),
-            storage: Mutex::new(storage),
-            memory,
-            neighbours: Mutex::new(neighbours::NeighbourTable::new(memory.max_neighbours)),
-            remote_logins: Mutex::new(remote::RemoteLoginTable::new()),
-            inbound: Channel::new(),
-            outbound: SortedOutboundChannel::new(memory.outbound_queue_len),
-            #[cfg(feature = "mqtt")]
-            mqtt: core::array::from_fn(|_| Channel::new()),
             ota_requested: Cell::new(false),
             ota_address: Cell::new(None),
             ota_waker: RefCell::new(None),
             ota_generation: Cell::new(0),
+            #[cfg(feature = "mqtt")]
+            mqtt: core::array::from_fn(|_| Channel::new()),
             #[cfg(feature = "mqtt")]
             mqtt_generation: Cell::new(0),
             #[cfg(feature = "mqtt")]
@@ -183,390 +72,7 @@ where
             }),
             #[cfg(feature = "mqtt")]
             mqtt_errors: core::array::from_fn(|_| Cell::new(None)),
-            reboot_after_next_remote_reply: Cell::new(false),
-            seen_packets: RefCell::new(SeenPacketCache::new_with_capacity(
-                SEEN_PACKET_TTL_MS,
-                memory.seen_packet_cache_len,
-            )),
-            pending_forwards: RefCell::new(Vec::with_capacity(
-                memory.outbound_queue_len.min(OUTBOUND_QUEUE_CAPACITY),
-            )),
-            pending_discover: RefCell::new(None),
-            started_at_ms: crate::platform::now_millis(),
-            sent_direct: AtomicU32::new(0),
-            sent_flood: AtomicU32::new(0),
-            received_direct: AtomicU32::new(0),
-            received_flood: AtomicU32::new(0),
-            duplicates_direct: AtomicU32::new(0),
-            duplicates_flood: AtomicU32::new(0),
-            packets_received: AtomicU32::new(0),
-            packets_sent: AtomicU32::new(0),
-            tx_airtime_ms: AtomicU32::new(0),
-            packet_errors: AtomicU32::new(0),
-            battery_level_percent: AtomicU8::new(BATTERY_LEVEL_UNKNOWN),
-            battery_millivolts: AtomicU16::new(BATTERY_MILLIVOLTS_UNKNOWN),
-            last_rssi: AtomicI16::new(0),
-            last_snr_quarters: AtomicI16::new(0),
         }
-    }
-
-    pub async fn with_config<R>(&self, read: impl FnOnce(&config::AppConfig) -> R) -> R {
-        let config = self.config.lock().await;
-        read(&config)
-    }
-
-    pub async fn with_identity<R>(&self, read: impl FnOnce(&identity::Identity) -> R) -> R {
-        let config = self.config.lock().await;
-        read(config.identity())
-    }
-
-    pub async fn public_key(&self) -> [u8; mcrs_protocol::PUB_KEY_SIZE] {
-        self.with_identity(|identity| *identity.public_key()).await
-    }
-
-    pub async fn public_key_prefix<const N: usize>(&self) -> [u8; N] {
-        let public_key = self.public_key().await;
-        let mut prefix = [0; N];
-        prefix.copy_from_slice(&public_key[..N]);
-        prefix
-    }
-
-    pub async fn update_config<F>(&self, update: F) -> Result<(), ConfigUpdateError>
-    where
-        F: FnOnce(&mut config::AppConfig) -> Result<(), config::ConfigError>,
-    {
-        let mut config = self.config.lock().await;
-        let previous_acl = config.acl().clone();
-        update(&mut config)?;
-        let mut logins = self.remote_logins.lock().await;
-        for key in previous_acl.changed_keys(config.acl()) {
-            logins.remove(key);
-        }
-        drop(logins);
-        let mut storage = self.storage.lock().await;
-        Ok(config.save(&mut *storage)?)
-    }
-
-    pub async fn reset_config(&self) -> Result<(), crate::platform::storage::Error> {
-        let mut storage = self.storage.lock().await;
-        config::AppConfig::save_unprovisioned(&mut *storage)
-    }
-
-    pub async fn observe_neighbour_packet(
-        &self,
-        packet: &Packet,
-        rssi: i16,
-        snr_quarters: i16,
-        now_ms: u64,
-    ) {
-        let node_hash = self.node_hash().await;
-        self.neighbours
-            .lock()
-            .await
-            .observe_packet(packet, rssi, snr_quarters, now_ms, &node_hash);
-    }
-
-    pub async fn observe_neighbour_public_key(
-        &self,
-        public_key: [u8; mcrs_protocol::PUB_KEY_SIZE],
-        rssi: i16,
-        snr_quarters: i16,
-        now_ms: u64,
-    ) {
-        let node_hash = self.node_hash().await;
-        self.neighbours.lock().await.observe_public_key(
-            public_key,
-            rssi,
-            snr_quarters,
-            now_ms,
-            &node_hash,
-        );
-    }
-
-    pub async fn encode_neighbours_binary_response(
-        &self,
-        request: &[u8],
-        now_ms: u64,
-        out: &mut Vec<u8>,
-    ) -> bool {
-        self.neighbours
-            .lock()
-            .await
-            .encode_binary_response(request, now_ms, out)
-    }
-
-    pub async fn write_neighbours_summary(&self, output: &mut impl fmt::Write) {
-        self.neighbours.lock().await.write_summary(output);
-    }
-
-    pub async fn authenticate_remote_login(
-        &self,
-        public_key: &[u8; mcrs_protocol::PUB_KEY_SIZE],
-        shared_secret: &[u8; 32],
-        privilege: remote::RemotePrivilege,
-        last_timestamp: u32,
-        now_ms: u64,
-        reply_path: &mcrs_protocol::Path,
-    ) {
-        self.remote_logins.lock().await.authenticate(
-            public_key,
-            shared_secret,
-            privilege,
-            last_timestamp,
-            now_ms,
-            reply_path,
-        );
-    }
-
-    pub async fn remote_privilege_for(
-        &self,
-        public_key: &[u8; mcrs_protocol::PUB_KEY_SIZE],
-        now_ms: u64,
-    ) -> Option<remote::RemotePrivilege> {
-        self.remote_logins
-            .lock()
-            .await
-            .privilege_for(public_key, now_ms)
-    }
-
-    pub async fn remote_sessions_matching_source_hash(
-        &self,
-        source_hash: u8,
-        now_ms: u64,
-    ) -> [Option<remote::RemoteSession>; remote::MAX_REMOTE_SESSIONS] {
-        self.remote_logins
-            .lock()
-            .await
-            .sessions_matching_source_hash(source_hash, now_ms)
-    }
-
-    pub async fn accept_newer_remote_timestamp(
-        &self,
-        public_key: &[u8; mcrs_protocol::PUB_KEY_SIZE],
-        privilege: remote::RemotePrivilege,
-        timestamp: u32,
-        now_ms: u64,
-    ) -> bool {
-        self.remote_logins
-            .lock()
-            .await
-            .accept_newer_timestamp(public_key, privilege, timestamp, now_ms)
-    }
-
-    pub async fn node_hash(&self) -> [u8; identity::NODE_HASH_SIZE] {
-        self.with_identity(|identity| *identity.node_hash()).await
-    }
-
-    pub fn status(&self) -> Status {
-        let uptime_millis = crate::platform::now_millis().saturating_sub(self.started_at_ms);
-        Status {
-            uptime_seconds: uptime_millis / 1000,
-            uptime_millis,
-            sent_direct: self.sent_direct.load(Ordering::Relaxed),
-            sent_flood: self.sent_flood.load(Ordering::Relaxed),
-            received_direct: self.received_direct.load(Ordering::Relaxed),
-            received_flood: self.received_flood.load(Ordering::Relaxed),
-            duplicates_direct: self.duplicates_direct.load(Ordering::Relaxed),
-            duplicates_flood: self.duplicates_flood.load(Ordering::Relaxed),
-            packets_received: self.packets_received.load(Ordering::Relaxed),
-            packets_sent: self.packets_sent.load(Ordering::Relaxed),
-            tx_airtime_ms: self.tx_airtime_ms.load(Ordering::Relaxed),
-            packet_errors: self.packet_errors.load(Ordering::Relaxed),
-            outbound_queue_len: self.outbound.len().min(u16::MAX as usize) as u16,
-            battery_level_percent: optional_battery_level(
-                self.battery_level_percent.load(Ordering::Relaxed),
-            )
-            .or_else(crate::platform::battery_level_percent),
-            battery_millivolts: optional_battery_millivolts(
-                self.battery_millivolts.load(Ordering::Relaxed),
-            )
-            .or_else(crate::platform::battery_millivolts),
-            last_rssi: self.last_rssi.load(Ordering::Relaxed),
-            last_snr_quarters: self.last_snr_quarters.load(Ordering::Relaxed),
-        }
-    }
-
-    pub async fn outbound_region_label(&self, packet: &[u8]) -> Option<String> {
-        let packet = Packet::decode(packet).ok()?;
-        self.packet_region_label(&packet).await
-    }
-
-    async fn packet_region_label(&self, packet: &Packet) -> Option<String> {
-        match packet.route_type {
-            RouteType::TransportFlood => {
-                self.with_config(|config| {
-                    config
-                        .regions()
-                        .match_flood_region(&packet)
-                        .map(|region| String::from(region.display_name()))
-                })
-                .await
-            }
-            RouteType::Flood => Some(String::from("*")),
-            _ => None,
-        }
-    }
-
-    pub fn set_battery_millivolts(&self, battery_millivolts: Option<u16>) {
-        self.battery_millivolts.store(
-            battery_millivolts.unwrap_or(BATTERY_MILLIVOLTS_UNKNOWN),
-            Ordering::Relaxed,
-        );
-    }
-
-    pub fn set_battery_level_percent(&self, battery_level_percent: Option<u8>) {
-        self.battery_level_percent.store(
-            battery_level_percent
-                .map(|level| level.min(100))
-                .unwrap_or(BATTERY_LEVEL_UNKNOWN),
-            Ordering::Relaxed,
-        );
-    }
-
-    fn record_packet_received(&self, rssi: i16, snr_quarters: i16) {
-        self.packets_received
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_add(1))
-            })
-            .ok();
-        self.last_rssi.store(rssi, Ordering::Relaxed);
-        self.last_snr_quarters
-            .store(snr_quarters, Ordering::Relaxed);
-    }
-
-    fn record_packet_sent(&self) {
-        self.packets_sent
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_add(1))
-            })
-            .ok();
-    }
-
-    fn record_tx_airtime(&self, airtime_ms: u32) {
-        self.tx_airtime_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                Some(total.saturating_add(airtime_ms))
-            })
-            .ok();
-    }
-
-    fn record_packet_error(&self) {
-        self.packet_errors
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_add(1))
-            })
-            .ok();
-    }
-
-    #[cfg(feature = "mqtt")]
-    fn report_mqtt_packet(
-        &self,
-        direction: mqtt::Direction,
-        payload: &[u8],
-        rssi: i16,
-        snr_quarters: i16,
-    ) {
-        for channel in &self.mqtt {
-            let _ = channel.try_send(mqtt::PacketEvent::new(
-                direction,
-                payload,
-                rssi,
-                snr_quarters,
-            ));
-        }
-    }
-
-    #[cfg(feature = "mqtt")]
-    pub async fn receive_mqtt_packet(&self, index: usize) -> mqtt::PacketEvent {
-        self.mqtt[index].receive().await
-    }
-
-    fn enqueue_inbound(
-        &self,
-        payload: &[u8],
-        rssi: i16,
-        snr_quarters: i16,
-    ) -> Result<(), InboundError> {
-        if self.inbound.len() >= self.memory.inbound_queue_len {
-            return Err(InboundError::QueueFull);
-        }
-
-        let mut packet = Vec::new();
-        packet.extend_from_slice(payload);
-        self.inbound
-            .try_send(RxEvent {
-                payload: packet,
-                rssi,
-                snr_quarters,
-                received_at_ms: crate::platform::now_millis(),
-            })
-            .map_err(|_| InboundError::QueueFull)
-    }
-
-    async fn receive_inbound(&self) -> RxEvent {
-        self.inbound.receive().await
-    }
-
-    pub fn enqueue_outbound(&self, packet: Vec<u8>) -> Result<(), OutboundError> {
-        self.enqueue_outbound_after(packet, 0)
-    }
-
-    pub fn enqueue_outbound_after(
-        &self,
-        packet: Vec<u8>,
-        delay_ms: u32,
-    ) -> Result<(), OutboundError> {
-        self.enqueue_outbound_after_internal(packet, delay_ms, false)
-    }
-
-    pub fn enqueue_outbound_reboot_after_tx(&self, packet: Vec<u8>) -> Result<(), OutboundError> {
-        self.enqueue_outbound_after_internal(packet, 0, true)
-    }
-
-    fn enqueue_outbound_after_internal(
-        &self,
-        packet: Vec<u8>,
-        delay_ms: u32,
-        reboot_after_tx: bool,
-    ) -> Result<(), OutboundError> {
-        self.enqueue_outbound_item(packet, delay_ms, reboot_after_tx, None)
-    }
-
-    fn enqueue_forward(
-        &self,
-        packet: Vec<u8>,
-        delay_ms: u32,
-        signature: [u8; 8],
-    ) -> Result<bool, OutboundError> {
-        if !self.reserve_forward(signature)? {
-            return Ok(false);
-        }
-        if let Err(error) = self.enqueue_outbound_item(packet, delay_ms, false, Some(signature)) {
-            self.release_forward(signature, false);
-            return Err(error);
-        }
-        Ok(true)
-    }
-
-    fn enqueue_outbound_item(
-        &self,
-        packet: Vec<u8>,
-        delay_ms: u32,
-        reboot_after_tx: bool,
-        dedup_signature: Option<[u8; 8]>,
-    ) -> Result<(), OutboundError> {
-        let queued = QueuedTransmit {
-            eligible_at_ms: crate::platform::now_millis().saturating_add(delay_ms as u64),
-            attempts: 0,
-            packet,
-            dedup_signature,
-            reboot_after_tx,
-        };
-        self.outbound.try_send(queued)
-    }
-
-    pub fn request_reboot_after_next_remote_reply(&self) {
-        self.reboot_after_next_remote_reply.set(true);
     }
 
     pub fn request_ota_start(&self) {
@@ -597,6 +103,19 @@ where
 
     pub fn register_ota_waker(&self, waker: &Waker) {
         self.ota_waker.borrow_mut().replace(waker.clone());
+    }
+
+    fn wake_ota(&self) {
+        self.ota_generation
+            .set(self.ota_generation.get().wrapping_add(1));
+        if let Some(waker) = self.ota_waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+
+    #[cfg(feature = "mqtt")]
+    pub async fn receive_mqtt_packet(&self, index: usize) -> mqtt::PacketEvent {
+        self.mqtt[index].receive().await
     }
 
     #[cfg(feature = "mqtt")]
@@ -658,1100 +177,310 @@ where
         self.mqtt_errors.get(index).and_then(Cell::get)
     }
 
-    fn wake_ota(&self) {
-        self.ota_generation
-            .set(self.ota_generation.get().wrapping_add(1));
-        if let Some(waker) = self.ota_waker.borrow_mut().take() {
-            waker.wake();
-        }
-    }
-
-    fn take_reboot_after_next_remote_reply(&self) -> bool {
-        let reboot = self.reboot_after_next_remote_reply.get();
-        self.reboot_after_next_remote_reply.set(false);
-        reboot
-    }
-
-    fn is_seen_or_pending(&self, signature: [u8; 8]) -> bool {
-        if self.pending_forwards.borrow().contains(&signature) {
-            return true;
-        }
-        self.seen_packets
-            .borrow_mut()
-            .contains(signature, crate::platform::now_millis())
-    }
-
-    fn reserve_forward(&self, signature: [u8; 8]) -> Result<bool, OutboundError> {
-        if self.is_seen_or_pending(signature) {
-            return Ok(false);
-        }
-        let mut pending = self.pending_forwards.borrow_mut();
-        if pending.len() >= self.memory.outbound_queue_len.min(OUTBOUND_QUEUE_CAPACITY) {
-            return Err(OutboundError::QueueFull);
-        }
-        pending.push(signature);
-        Ok(true)
-    }
-
-    fn release_forward(&self, signature: [u8; 8], transmitted: bool) {
-        let index = self
-            .pending_forwards
-            .borrow()
-            .iter()
-            .position(|pending| *pending == signature);
-        if let Some(index) = index {
-            self.pending_forwards.borrow_mut().remove(index);
-        }
-        if transmitted {
-            self.seen_packets
-                .borrow_mut()
-                .touch(signature, crate::platform::now_millis());
-        }
-    }
-
-    fn finish_forward(&self, signature: Option<[u8; 8]>, transmitted: bool) {
-        if let Some(signature) = signature {
-            self.release_forward(signature, transmitted);
-        }
-    }
-
-    pub fn start_discover_neighbours(&self, tag: u32, now_ms: u64) {
-        *self.pending_discover.borrow_mut() = Some(PendingDiscover {
-            tag,
-            expires_at_ms: now_ms.saturating_add(discovery::DISCOVER_NEIGHBOURS_TTL_MS),
-        });
-    }
-
-    fn accept_discover_response(&self, tag: u32, now_ms: u64) -> bool {
-        let mut pending = self.pending_discover.borrow_mut();
-        let Some(discover) = *pending else {
-            return false;
-        };
-        if now_ms > discover.expires_at_ms {
-            *pending = None;
-            return false;
-        }
-        discover.tag == tag
-    }
-}
-
-#[derive(Debug)]
-pub enum ConfigUpdateError {
-    Invalid(config::ConfigError),
-    Storage(crate::platform::storage::Error),
-}
-
-impl fmt::Display for ConfigUpdateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigUpdateError::Invalid(error) => write!(f, "{}", error),
-            ConfigUpdateError::Storage(error) => write!(f, "Storage write failed: {:?}", error),
-        }
-    }
-}
-
-impl From<config::ConfigError> for ConfigUpdateError {
-    fn from(error: config::ConfigError) -> Self {
-        Self::Invalid(error)
-    }
-}
-
-impl From<crate::platform::storage::Error> for ConfigUpdateError {
-    fn from(error: crate::platform::storage::Error) -> Self {
-        Self::Storage(error)
-    }
-}
-
-fn optional_battery_level(level: u8) -> Option<u8> {
-    (level != BATTERY_LEVEL_UNKNOWN).then_some(level)
-}
-
-fn optional_battery_millivolts(millivolts: u16) -> Option<u16> {
-    (millivolts != BATTERY_MILLIVOLTS_UNKNOWN).then_some(millivolts)
-}
-
-#[derive(Debug)]
-pub enum InboundError {
-    QueueFull,
-}
-
-#[derive(Debug)]
-pub enum OutboundError {
-    QueueFull,
-}
-
-fn increment_route_counter(route: RouteType, direct: &AtomicU32, flood: &AtomicU32) {
-    // Transport routes belong to the same categories as their unscoped forms.
-    let counter = if route.is_flood() { flood } else { direct };
-    counter.fetch_add(1, Ordering::Relaxed);
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Status {
-    pub uptime_seconds: u64,
-    pub uptime_millis: u64,
-    pub sent_direct: u32,
-    pub sent_flood: u32,
-    pub received_direct: u32,
-    pub received_flood: u32,
-    pub duplicates_direct: u32,
-    pub duplicates_flood: u32,
-    pub packets_received: u32,
-    pub packets_sent: u32,
-    pub tx_airtime_ms: u32,
-    pub packet_errors: u32,
-    pub outbound_queue_len: u16,
-    pub battery_level_percent: Option<u8>,
-    pub battery_millivolts: Option<u16>,
-    pub last_rssi: i16,
-    pub last_snr_quarters: i16,
-}
-
-#[derive(Clone, Copy)]
-struct PendingDiscover {
-    tag: u32,
-    expires_at_ms: u64,
-}
-
-struct QueuedTransmit {
-    eligible_at_ms: u64,
-    attempts: u8,
-    packet: Vec<u8>,
-    dedup_signature: Option<[u8; 8]>,
-    reboot_after_tx: bool,
-}
-
-#[derive(Clone, Copy)]
-struct NextOutbound {
-    is_forward: bool,
-    eligible_at_ms: u64,
-    packet_len: usize,
-}
-
-struct SortedOutboundChannel {
-    queue: BlockingMutex<CriticalSectionRawMutex, RefCell<Vec<QueuedTransmit>>>,
-    changed: Signal<CriticalSectionRawMutex, ()>,
-    capacity: usize,
-    active: AtomicU8,
-}
-
-impl SortedOutboundChannel {
-    fn new(configured_capacity: usize) -> Self {
-        let capacity = configured_capacity.min(OUTBOUND_QUEUE_CAPACITY);
-        Self {
-            queue: BlockingMutex::new(RefCell::new(Vec::with_capacity(capacity))),
-            changed: Signal::new(),
-            capacity,
-            active: AtomicU8::new(0),
-        }
-    }
-
-    fn try_send(&self, queued: QueuedTransmit) -> Result<(), OutboundError> {
-        self.queue.lock(|queue| {
-            let mut queue = queue.borrow_mut();
-            let total = queue
-                .len()
-                .saturating_add(self.active.load(Ordering::Relaxed) as usize);
-            if total >= self.capacity {
-                return Err(OutboundError::QueueFull);
-            }
-            let index = queue
-                .iter()
-                .position(|pending| queued.eligible_at_ms < pending.eligible_at_ms)
-                .unwrap_or(queue.len());
-            queue.insert(index, queued);
-            Ok(())
-        })?;
-        self.changed.signal(());
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.queue.lock(|queue| {
-            queue
-                .borrow()
-                .len()
-                .saturating_add(self.active.load(Ordering::Relaxed) as usize)
-        })
-    }
-
-    fn next(&self) -> Option<NextOutbound> {
-        self.queue.lock(|queue| {
-            queue.borrow().first().map(|queued| NextOutbound {
-                is_forward: queued.dedup_signature.is_some(),
-                eligible_at_ms: queued.eligible_at_ms,
-                packet_len: queued.packet.len(),
-            })
-        })
-    }
-
-    fn next_after_reset(&self) -> Option<NextOutbound> {
-        self.changed.reset();
-        self.next()
-    }
-
-    fn take_first(&self) -> Option<QueuedTransmit> {
-        self.queue.lock(|queue| {
-            let mut queue = queue.borrow_mut();
-            if queue.is_empty() {
-                None
-            } else {
-                self.active.store(1, Ordering::Relaxed);
-                Some(queue.remove(0))
-            }
-        })
-    }
-
-    fn retry_current(&self, mut queued: QueuedTransmit, retry_delay_ms: u32) -> Option<u32> {
-        let retried = self.queue.lock(|queue| {
-            let mut queue = queue.borrow_mut();
-            queued.attempts = queued.attempts.saturating_add(1);
-            if queued.attempts >= OUTBOUND_MAX_ATTEMPTS {
-                return None;
-            }
-            queued.eligible_at_ms =
-                crate::platform::now_millis().saturating_add(retry_delay_ms as u64);
-            let insert_at = queue
-                .iter()
-                .position(|pending| queued.eligible_at_ms < pending.eligible_at_ms)
-                .unwrap_or(queue.len());
-            queue.insert(insert_at, queued);
-            self.active.store(0, Ordering::Relaxed);
-            Some(retry_delay_ms)
-        });
-        if retried.is_some() {
-            self.changed.signal(());
-        }
-        retried
-    }
-
-    fn complete_current(&self) {
-        let previous = self.active.swap(0, Ordering::Relaxed);
-        debug_assert_eq!(previous, 1, "completed without an active outbound packet");
-    }
-
-    fn wait_changed(&self) -> impl Future<Output = ()> + '_ {
-        self.changed.wait()
-    }
-}
-
-struct AirtimeBudget {
-    available_ms: i64,
-    last_update_ms: u64,
-}
-
-impl AirtimeBudget {
-    fn new(now_ms: u64, duty_cycle_percent: u8) -> Self {
-        Self {
-            available_ms: duty_cycle_max_budget_ms(duty_cycle_percent) as i64,
-            last_update_ms: now_ms,
-        }
-    }
-
-    fn update(&mut self, now_ms: u64, duty_cycle_percent: u8) {
-        if duty_cycle_percent >= 100 {
-            self.available_ms = DUTY_CYCLE_WINDOW_MS as i64;
-            self.last_update_ms = now_ms;
-            return;
-        }
-        let max_budget_ms = duty_cycle_max_budget_ms(duty_cycle_percent) as i64;
-        self.available_ms = self.available_ms.min(max_budget_ms);
-        let elapsed_ms = now_ms.saturating_sub(self.last_update_ms);
-        let refill_ms = elapsed_ms.saturating_mul(duty_cycle_percent.clamp(1, 100) as u64) / 100;
-        if refill_ms > 0 {
-            self.available_ms = self
-                .available_ms
-                .saturating_add(refill_ms.min(i64::MAX as u64) as i64)
-                .min(max_budget_ms);
-            self.last_update_ms = now_ms;
-        }
-    }
-
-    fn ready_at_ms(&mut self, now_ms: u64, required_ms: u32, duty_cycle_percent: u8) -> u64 {
-        if duty_cycle_percent >= 100 {
-            return now_ms;
-        }
-        self.update(now_ms, duty_cycle_percent);
-        let required_ms = i64::from(required_ms);
-        if self.available_ms >= required_ms {
-            now_ms
-        } else {
-            let needed_ms = required_ms.saturating_sub(self.available_ms) as u64;
-            now_ms.saturating_add(div_ceil_u64(
-                needed_ms.saturating_mul(100),
-                duty_cycle_percent.clamp(1, 100) as u64,
-            ))
-        }
-    }
-
-    fn record_transmit(&mut self, now_ms: u64, airtime_ms: u32, duty_cycle_percent: u8) {
-        if duty_cycle_percent >= 100 {
-            return;
-        }
-        self.update(now_ms, duty_cycle_percent);
-        self.available_ms = self.available_ms.saturating_sub(i64::from(airtime_ms));
-    }
-}
-
-fn duty_cycle_max_budget_ms(duty_cycle_percent: u8) -> u64 {
-    DUTY_CYCLE_WINDOW_MS * duty_cycle_percent.clamp(1, 100) as u64 / 100
-}
-
-struct RxEvent {
-    payload: Vec<u8>,
-    rssi: i16,
-    snr_quarters: i16,
-    received_at_ms: u64,
-}
-
-enum RadioWait {
-    Packet(Result<crate::modules::ReceivedPacket, ()>),
-    OutboundChanged,
-    OutboundDue,
-}
-
-pub async fn radio_loop<R, S, D>(radio: &mut R, context: &AppContext<S>, delay: &mut D) -> !
-where
-    R: crate::modules::Receiver,
-    S: crate::platform::storage::Storage,
-    D: DelayNs,
-{
-    let mut receive_buffer = [0u8; RECEIVE_BUFFER_LEN];
-    let duty_cycle_percent = context
-        .with_config(|config| config.duty_cycle_percent())
-        .await;
-    let mut airtime_budget = AirtimeBudget::new(crate::platform::now_millis(), duty_cycle_percent);
-
-    loop {
-        transmit_eligible_outbound(radio, context, delay, &mut airtime_budget).await;
-
-        match wait_for_read_or_eligible_outbound(
-            radio,
-            context,
-            &mut receive_buffer,
-            delay,
-            &mut airtime_budget,
-        )
-        .await
-        {
-            RadioWait::OutboundDue => continue,
-            RadioWait::OutboundChanged => continue,
-            RadioWait::Packet(Ok(packet)) => {
-                context.record_packet_received(packet.rssi, packet.snr_quarters);
-                if packet.len > receive_buffer.len() {
-                    context.record_packet_error();
-                    crate::platform::log_fmt(format_args!(
-                        "Radio RX: packet length {} exceeds buffer {}",
-                        packet.len,
-                        receive_buffer.len()
-                    ));
-                    continue;
-                }
-                let payload = &receive_buffer[..packet.len];
-                crate::platform::log_radio_packet_received(
-                    packet.len,
-                    packet.rssi,
-                    packet.snr_quarters,
-                    payload,
-                );
-                #[cfg(feature = "mqtt")]
-                context.report_mqtt_packet(
-                    mqtt::Direction::Rx,
-                    payload,
-                    packet.rssi,
-                    packet.snr_quarters,
-                );
-
-                if context
-                    .enqueue_inbound(payload, packet.rssi, packet.snr_quarters)
-                    .is_err()
-                {
-                    context.record_packet_error();
-                    crate::platform::log_fmt(format_args!("Radio RX: inbound queue full"));
-                }
-            }
-            RadioWait::Packet(Err(())) => {
-                context.record_packet_error();
-                crate::platform::log_radio_receive_failed();
-                delay.delay_ms(1000).await;
-            }
-        }
-    }
-}
-
-pub async fn handler_loop<S>(context: &AppContext<S>) -> !
-where
-    S: crate::platform::storage::Storage,
-{
-    loop {
-        let event = context.receive_inbound().await;
-        handle_rx_event(context, event).await;
-    }
-}
-
-async fn handle_rx_event<S>(context: &AppContext<S>, event: RxEvent)
-where
-    S: crate::platform::storage::Storage,
-{
-    match mcrs_protocol::Packet::decode(&event.payload) {
-        Ok(protocol_packet) => {
-            increment_route_counter(
-                protocol_packet.route_type,
-                &context.received_direct,
-                &context.received_flood,
-            );
-            let region = context.packet_region_label(&protocol_packet).await;
-            protocol_log::log_packet(&protocol_packet, region.as_deref());
-            let node_hash = context.node_hash().await;
-            context
-                .observe_neighbour_packet(
-                    &protocol_packet,
-                    event.rssi,
-                    event.snr_quarters,
-                    event.received_at_ms,
-                )
-                .await;
-            if let Some(response) = cli::handle_remote_packet(&protocol_packet, context).await {
-                crate::platform::log_fmt(format_args!(
-                    "Remote response: queueing {} bytes",
-                    response.len()
-                ));
-                let result = if context.take_reboot_after_next_remote_reply() {
-                    context.enqueue_outbound_reboot_after_tx(response)
+    fn handle_ota_command(&self, command: &str, request: CliRequest) -> String {
+        let mut parts = command.split_ascii_whitespace();
+        let _ota = parts.next();
+        match parts.next() {
+            None | Some("status") => ota_status_text(),
+            Some("start") => {
+                if !request.is_passworded() {
+                    denied_text()
                 } else {
-                    context.enqueue_outbound(response)
-                };
-                if result.is_err() {
-                    crate::platform::log_fmt(format_args!("Remote response: outbound queue full"));
-                }
-            }
-            if let Some(response) = discovery::handle_control_packet(
-                &protocol_packet,
-                context,
-                event.rssi,
-                event.snr_quarters,
-                event.received_at_ms,
-            )
-            .await
-            {
-                crate::platform::log_fmt(format_args!(
-                    "Discovery response: queueing {} bytes",
-                    response.len()
-                ));
-                if context.enqueue_outbound(response).is_err() {
-                    crate::platform::log_fmt(format_args!(
-                        "Discovery response: outbound queue full"
-                    ));
-                }
-            }
-            apply_repeater_rules(context, protocol_packet, event.snr_quarters, &node_hash).await;
-        }
-        Err(error) => {
-            context.record_packet_error();
-            protocol_log::log_decode_failed(&error);
-        }
-    }
-}
-
-async fn transmit_eligible_outbound<R, S, D>(
-    radio: &mut R,
-    context: &AppContext<S>,
-    delay: &mut D,
-    airtime_budget: &mut AirtimeBudget,
-) where
-    R: crate::modules::Receiver,
-    S: crate::platform::storage::Storage,
-    D: DelayNs,
-{
-    let (radio_config, duty_cycle_percent, repeat_enabled) = context
-        .with_config(|config| {
-            (
-                config.radio(),
-                config.duty_cycle_percent(),
-                config.repeat_enabled(),
-            )
-        })
-        .await;
-    let now_ms = crate::platform::now_millis();
-    let Some(next) = context.outbound.next() else {
-        return;
-    };
-    if next.is_forward && !repeat_enabled {
-        if let Some(queued) = context.outbound.take_first() {
-            context.finish_forward(queued.dedup_signature, false);
-            context.outbound.complete_current();
-        }
-        return;
-    }
-    if next.eligible_at_ms > now_ms {
-        return;
-    }
-    let required_ms = if duty_cycle_percent >= 100 {
-        0
-    } else {
-        radio_config.packet_airtime_ms(next.packet_len)
-    };
-    if airtime_budget.ready_at_ms(now_ms, required_ms, duty_cycle_percent) > now_ms {
-        return;
-    }
-    let Some(queued) = context.outbound.take_first() else {
-        return;
-    };
-    let region = context.outbound_region_label(&queued.packet).await;
-    if transmit_when_clear(radio, &queued.packet, radio_config, delay)
-        .await
-        .is_err()
-    {
-        context.record_packet_error();
-        crate::platform::log_fmt(format_args!("Outbound packet: transmit failed"));
-        let dedup_signature = queued.dedup_signature;
-        let retry_delay_ms = OUTBOUND_RETRY_DELAY_MIN_MS
-            + crate::platform::random_u32()
-                % (OUTBOUND_RETRY_DELAY_MAX_MS - OUTBOUND_RETRY_DELAY_MIN_MS + 1);
-        if let Some(retry_delay_ms) = context.outbound.retry_current(queued, retry_delay_ms) {
-            crate::platform::log_fmt(format_args!(
-                "Outbound packet: retry scheduled in {} ms",
-                retry_delay_ms
-            ));
-        } else {
-            context.finish_forward(dedup_signature, false);
-            context.outbound.complete_current();
-            crate::platform::log_fmt(format_args!(
-                "Outbound packet: dropped after {} failed attempts",
-                OUTBOUND_MAX_ATTEMPTS
-            ));
-        }
-        return;
-    }
-    context.finish_forward(queued.dedup_signature, true);
-    context.outbound.complete_current();
-    context.record_packet_sent();
-    if let Ok(packet) = Packet::decode(&queued.packet) {
-        increment_route_counter(packet.route_type, &context.sent_direct, &context.sent_flood);
-    }
-    #[cfg(feature = "mqtt")]
-    context.report_mqtt_packet(mqtt::Direction::Tx, &queued.packet, 0, 0);
-    let airtime_ms = radio_config.packet_airtime_ms(queued.packet.len());
-    context.record_tx_airtime(airtime_ms);
-    airtime_budget.record_transmit(
-        crate::platform::now_millis(),
-        airtime_ms,
-        duty_cycle_percent,
-    );
-    if duty_cycle_percent >= 100 {
-        match region {
-            Some(region) => crate::platform::log_fmt(format_args!(
-                "Outbound packet: transmitted {} bytes region={} airtime={}ms dutycycle=100% budget=unlimited",
-                queued.packet.len(),
-                region,
-                airtime_ms
-            )),
-            None => crate::platform::log_fmt(format_args!(
-                "Outbound packet: transmitted {} bytes airtime={}ms dutycycle=100% budget=unlimited",
-                queued.packet.len(),
-                airtime_ms
-            )),
-        }
-    } else {
-        match region {
-            Some(region) => crate::platform::log_fmt(format_args!(
-                "Outbound packet: transmitted {} bytes region={} airtime={}ms dutycycle={}% budget={}ms",
-                queued.packet.len(),
-                region,
-                airtime_ms,
-                duty_cycle_percent,
-                airtime_budget.available_ms
-            )),
-            None => crate::platform::log_fmt(format_args!(
-                "Outbound packet: transmitted {} bytes airtime={}ms dutycycle={}% budget={}ms",
-                queued.packet.len(),
-                airtime_ms,
-                duty_cycle_percent,
-                airtime_budget.available_ms
-            )),
-        }
-    }
-    if queued.reboot_after_tx {
-        crate::platform::reboot();
-    }
-}
-
-async fn wait_for_read_or_eligible_outbound<R, S, D>(
-    radio: &mut R,
-    context: &AppContext<S>,
-    receive_buffer: &mut [u8],
-    delay: &mut D,
-    airtime_budget: &mut AirtimeBudget,
-) -> RadioWait
-where
-    R: crate::modules::Receiver,
-    S: crate::platform::storage::Storage,
-    D: DelayNs,
-{
-    let (radio_config, duty_cycle_percent) = context
-        .with_config(|config| (config.radio(), config.duty_cycle_percent()))
-        .await;
-    let now_ms = crate::platform::now_millis();
-    let next = context.outbound.next_after_reset();
-    let budget_ready_ms = match next {
-        Some(_) if duty_cycle_percent >= 100 => now_ms,
-        Some(queued) => airtime_budget.ready_at_ms(
-            now_ms,
-            radio_config.packet_airtime_ms(queued.packet_len),
-            duty_cycle_percent,
-        ),
-        None => now_ms,
-    };
-    if next.is_some_and(|queued| queued.eligible_at_ms <= now_ms && now_ms >= budget_ready_ms) {
-        return RadioWait::OutboundDue;
-    }
-
-    let mut receive = pin!(radio.wait_for_read(receive_buffer));
-    let mut outbound_changed = pin!(context.outbound.wait_changed());
-
-    let Some(eligible_at_ms) = next.map(|queued| queued.eligible_at_ms.max(budget_ready_ms)) else {
-        return poll_fn(|cx| {
-            if outbound_changed.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(RadioWait::OutboundChanged);
-            }
-
-            match receive.as_mut().poll(cx) {
-                Poll::Ready(result) => Poll::Ready(RadioWait::Packet(result)),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await;
-    };
-
-    let wait_ms = eligible_at_ms
-        .saturating_sub(crate::platform::now_millis())
-        .min(u32::MAX as u64) as u32;
-    let mut timer = pin!(delay.delay_ms(wait_ms));
-    poll_fn(|cx| {
-        if outbound_changed.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(RadioWait::OutboundChanged);
-        }
-        if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(RadioWait::OutboundDue);
-        }
-        match receive.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(RadioWait::Packet(result)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await
-}
-
-async fn apply_repeater_rules<S>(
-    context: &AppContext<S>,
-    packet: Packet,
-    snr_quarters: i16,
-    node_hash: &[u8],
-) where
-    S: crate::platform::storage::Storage,
-{
-    match prepare_forward(context, packet, snr_quarters, node_hash).await {
-        ForwardDecision::Forward { packet, signature } => {
-            queue_repeater_packet(context, packet, signature, node_hash, "forward").await;
-        }
-        ForwardDecision::Capture { packet, signature } => {
-            queue_repeater_packet(context, packet, signature, node_hash, "capture").await;
-        }
-        ForwardDecision::Drop(reason) => {
-            crate::platform::log_fmt(format_args!("Protocol repeater: drop: {}", reason));
-        }
-        ForwardDecision::DoNotForward => {}
-    }
-}
-
-async fn queue_repeater_packet<S>(
-    context: &AppContext<S>,
-    packet: Packet,
-    signature: [u8; 8],
-    node_hash: &[u8],
-    action: &'static str,
-) where
-    S: crate::platform::storage::Storage,
-{
-    let delay_ms = forwarding_delay_ms(signature, node_hash);
-    let Ok(encoded) = packet.encode() else {
-        crate::platform::log_fmt(format_args!("Protocol repeater: {} encode failed", action));
-        return;
-    };
-    if encoded.len() > FORWARD_BUFFER_LEN {
-        crate::platform::log_fmt(format_args!(
-            "Protocol repeater: encoded {} too long: {} bytes",
-            action,
-            encoded.len()
-        ));
-        return;
-    }
-
-    let encoded_len = encoded.len();
-    match context.enqueue_forward(encoded, delay_ms, signature) {
-        Ok(true) => {}
-        Ok(false) => {
-            increment_route_counter(
-                packet.route_type,
-                &context.duplicates_direct,
-                &context.duplicates_flood,
-            );
-            crate::platform::log_fmt(format_args!("Protocol repeater: drop: duplicate"));
-            return;
-        }
-        Err(OutboundError::QueueFull) => {
-            crate::platform::log_fmt(format_args!("Protocol repeater: outbound queue full"));
-            return;
-        }
-    }
-
-    crate::platform::log_fmt(format_args!(
-        "Protocol repeater: queued {} {} bytes, eligible in {} ms",
-        action, encoded_len, delay_ms
-    ));
-}
-
-async fn prepare_forward(
-    context: &AppContext<impl crate::platform::storage::Storage>,
-    packet: Packet,
-    snr_quarters: i16,
-    node_hash: &[u8],
-) -> ForwardDecision {
-    if !context.with_config(|config| config.repeat_enabled()).await {
-        return ForwardDecision::DoNotForward;
-    }
-    if matches!(
-        packet.payload.kind(),
-        PayloadKind::Reserved(_) | PayloadKind::RawCustom
-    ) {
-        return ForwardDecision::Drop("unsupported payload kind");
-    }
-
-    match packet.payload.kind() {
-        PayloadKind::Trace => prepare_trace_forward(packet, snr_quarters, node_hash),
-        _ if packet.route_type.is_flood() => {
-            prepare_flood_forward(context, packet, node_hash).await
-        }
-        _ if packet.route_type.is_direct() => prepare_direct_forward(packet, node_hash),
-        _ => ForwardDecision::Drop("unknown route"),
-    }
-}
-
-async fn prepare_flood_forward(
-    context: &AppContext<impl crate::platform::storage::Storage>,
-    mut packet: Packet,
-    node_hash: &[u8],
-) -> ForwardDecision {
-    if !matches!(
-        packet.route_type,
-        RouteType::Flood | RouteType::TransportFlood
-    ) {
-        return ForwardDecision::Drop("not flood routed");
-    }
-
-    let captured = if packet.route_type == RouteType::Flood {
-        match context
-            .with_config(|config| {
-                if !config.region_capture() {
-                    return Ok(false);
-                }
-                if packet
-                    .normal_path()
-                    .is_none_or(|path| path.hop_count() != 0)
-                {
-                    return Ok(false);
-                }
-                config.regions().apply_default_scope(&mut packet)
-            })
-            .await
-        {
-            Ok(captured) => captured,
-            Err(_) => return ForwardDecision::Drop("default region scope failed"),
-        }
-    } else {
-        false
-    };
-
-    let Some((unscoped, max_unscoped_hops, max_advert_hops, loop_detection)) = context
-        .with_config(|config| {
-            config.regions().match_flood_region(&packet).map(|region| {
-                (
-                    region.is_wildcard(),
-                    config.flood_max_unscoped_hops(),
-                    config.flood_max_advert_hops(),
-                    config.loop_detection(),
-                )
-            })
-        })
-        .await
-    else {
-        return ForwardDecision::Drop("unknown or denied flood region");
-    };
-
-    let Some(path) = packet.normal_path() else {
-        return ForwardDecision::Drop("flood packet without normal path");
-    };
-    let hop_count = path.hop_count();
-    if loop_detection.detects_loop(path, node_hash) {
-        return ForwardDecision::Drop("loop detected");
-    }
-    if packet.payload.kind() == PayloadKind::Advert && hop_count >= max_advert_hops as usize {
-        return ForwardDecision::DoNotForward;
-    }
-    if unscoped && hop_count >= max_unscoped_hops as usize {
-        return ForwardDecision::DoNotForward;
-    }
-
-    // Capture changes the flood routing namespace. Derive the signature only after
-    // that transformation so scoped and unscoped copies deduplicate independently.
-    let signature = match packet.dedup_signature() {
-        Ok(signature) => signature,
-        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
-    };
-    if packet.append_flood_hop(node_hash).is_err() {
-        return ForwardDecision::DoNotForward;
-    }
-
-    if captured {
-        ForwardDecision::Capture { packet, signature }
-    } else {
-        ForwardDecision::Forward { packet, signature }
-    }
-}
-
-fn prepare_direct_forward(mut packet: Packet, node_hash: &[u8]) -> ForwardDecision {
-    if !matches!(
-        packet.route_type,
-        RouteType::Direct | RouteType::TransportDirect
-    ) {
-        return ForwardDecision::Drop("not direct routed");
-    }
-
-    let Some(path) = packet.normal_path() else {
-        return ForwardDecision::Drop("direct packet without normal path");
-    };
-    if path.hop_count() == 0 {
-        return ForwardDecision::DoNotForward;
-    }
-
-    let signature = match packet.dedup_signature() {
-        Ok(signature) => signature,
-        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
-    };
-    match packet.consume_direct_hop(node_hash) {
-        Ok(true) => ForwardDecision::Forward { packet, signature },
-        Ok(false) => ForwardDecision::DoNotForward,
-        Err(_) => ForwardDecision::Drop("direct path mutation failed"),
-    }
-}
-
-fn prepare_trace_forward(
-    mut packet: Packet,
-    snr_quarters: i16,
-    node_hash: &[u8],
-) -> ForwardDecision {
-    if packet.route_type != RouteType::Direct {
-        return ForwardDecision::Drop("trace is not direct routed");
-    }
-    if !matches!(&packet.path, RoutePath::Trace(_)) {
-        return ForwardDecision::Drop("trace packet without trace path");
-    }
-    match packet.trace_is_complete() {
-        Ok(true) => return ForwardDecision::DoNotForward,
-        Ok(false) => {}
-        Err(_) => return ForwardDecision::Drop("trace completion check failed"),
-    }
-    match packet.trace_next_hop_matches(node_hash) {
-        Ok(true) => {}
-        Ok(false) => return ForwardDecision::DoNotForward,
-        Err(_) => return ForwardDecision::Drop("trace next-hop check failed"),
-    }
-
-    let signature = match packet.dedup_signature() {
-        Ok(signature) => signature,
-        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
-    };
-    if packet
-        .append_trace_snr(snr_quarters.clamp(i8::MIN as i16, i8::MAX as i16) as i8)
-        .is_err()
-    {
-        return ForwardDecision::DoNotForward;
-    }
-
-    ForwardDecision::Forward { packet, signature }
-}
-
-fn forwarding_delay_ms(signature: [u8; 8], node_hash: &[u8]) -> u32 {
-    FORWARD_DELAY_BASE_MS + (forwarding_jitter_seed(signature, node_hash) % FORWARD_DELAY_JITTER_MS)
-}
-
-fn forwarding_jitter_seed(signature: [u8; 8], node_hash: &[u8]) -> u32 {
-    let mut seed = 0x811c_9dc5u32;
-    for byte in signature.iter().chain(node_hash.iter()) {
-        seed ^= u32::from(*byte);
-        seed = seed.wrapping_mul(0x0100_0193);
-    }
-    seed
-}
-
-async fn transmit_when_clear<R, D>(
-    radio: &mut R,
-    payload: &[u8],
-    radio_config: config::RadioConfig,
-    delay: &mut D,
-) -> Result<(), ()>
-where
-    R: crate::modules::Receiver,
-    D: DelayNs,
-{
-    for attempt in 0..CAD_MAX_ATTEMPTS {
-        match radio.channel_is_busy().await {
-            Ok(false) => {
-                return radio.transmit(payload).await;
-            }
-            Ok(true) => {
-                let delay_ms = cad_busy_backoff_ms(payload, radio_config, attempt);
-                delay.delay_ms(delay_ms).await;
-            }
-            Err(()) => {
-                crate::platform::log_fmt(format_args!("CAD: failed"));
-                return Err(());
-            }
-        }
-    }
-
-    crate::platform::log_fmt(format_args!("CAD: channel stayed busy, dropping transmit"));
-    Err(())
-}
-
-fn cad_busy_backoff_ms(payload: &[u8], radio_config: config::RadioConfig, attempt: usize) -> u32 {
-    let airtime_ms = radio_config.packet_airtime_ms(payload.len());
-    let cad_time_ms = radio_config
-        .symbol_time_ms()
-        .saturating_mul(CAD_BUSY_BACKOFF_SYMBOLS);
-    let minimum_ms = CAD_BUSY_BACKOFF_BASE_MS.max(cad_time_ms);
-    let lower_ms = minimum_ms.max(airtime_ms / CAD_BUSY_BACKOFF_AIRTIME_DIVISOR);
-    let jitter_window_ms = airtime_ms.saturating_sub(lower_ms).max(minimum_ms);
-    let seed = payload
-        .get(attempt % payload.len().max(1))
-        .copied()
-        .unwrap_or(0) as u32;
-    lower_ms
-        .saturating_add(attempt as u32 * minimum_ms)
-        .saturating_add(seed % jitter_window_ms)
-}
-
-fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
-    numerator / denominator + u64::from(!numerator.is_multiple_of(denominator))
-}
-
-enum ForwardDecision {
-    Forward { packet: Packet, signature: [u8; 8] },
-    Capture { packet: Packet, signature: [u8; 8] },
-    DoNotForward,
-    Drop(&'static str),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mode_names_and_default() {
-        assert_eq!(LoopDetection::default(), LoopDetection::Minimal);
-        for (name, mode) in [
-            ("off", LoopDetection::Off),
-            ("minimal", LoopDetection::Minimal),
-            ("moderate", LoopDetection::Moderate),
-            ("strict", LoopDetection::Strict),
-        ] {
-            assert_eq!(LoopDetection::parse(name), Some(mode));
-            assert_eq!(mode.as_str(), name);
-        }
-        assert_eq!(LoopDetection::parse("unknown"), None);
-    }
-
-    #[test]
-    fn matches_upstream_thresholds_for_every_mode_and_hash_size() {
-        let node_hash = [0xf5, 0xa2, 0x19, 0x88];
-        for (mode, thresholds) in [
-            (LoopDetection::Off, [None, None, None]),
-            (LoopDetection::Minimal, [Some(4), Some(2), Some(1)]),
-            (LoopDetection::Moderate, [Some(2), Some(1), Some(1)]),
-            (LoopDetection::Strict, [Some(1), Some(1), Some(1)]),
-        ] {
-            for (index, threshold) in thresholds.into_iter().enumerate() {
-                let size = index + 1;
-                for matches in 0..=5 {
-                    let mut bytes = Vec::new();
-                    for _ in 0..matches {
-                        bytes.extend_from_slice(&node_hash[..size]);
-                        bytes.extend_from_slice(&[0x42; 3][..size]);
+                    self.request_ota_start();
+                    match self.ota_address() {
+                        Some(address) => format!("OTA: start requested; http://{}/", address),
+                        None => String::from("OTA: start requested; waiting for Wi-Fi"),
                     }
-                    let path = Path::new(HashSize::new(size).unwrap(), bytes).unwrap();
-                    assert_eq!(
-                        mode.detects_loop(&path, &node_hash),
-                        threshold.is_some_and(|limit| matches >= limit),
-                        "{mode:?}, {size}-byte IDs, {matches} matches",
-                    );
                 }
             }
+            Some("stop") => {
+                if !request.is_passworded() {
+                    denied_text()
+                } else {
+                    self.request_ota_stop();
+                    String::from("OTA: stop requested")
+                }
+            }
+            _ => String::from("Err - use 'ota status', 'ota start', or 'ota stop'"),
         }
     }
 
-    #[test]
-    fn wider_hashes_distinguish_collisions_and_other_nodes_loops_are_ignored() {
-        let node_hash = [0xf5, 0xa2, 0x19, 0x88];
-        let path = Path::new(HashSize::Two, alloc::vec![0xf5, 0x19, 0xf5, 0x19]).unwrap();
-        assert!(!LoopDetection::Strict.detects_loop(&path, &node_hash));
-        let path = Path::new(HashSize::One, alloc::vec![0xf5, 0x42, 0x43]).unwrap();
-        assert!(!LoopDetection::Minimal.detects_loop(&path, &node_hash));
-        assert!(LoopDetection::Strict.detects_loop(&path, &node_hash));
-    }
-
-    #[test]
-    fn categorizes_transport_routes() {
-        let direct = AtomicU32::new(0);
-        let flood = AtomicU32::new(0);
-        for route in [RouteType::Direct, RouteType::TransportDirect] {
-            increment_route_counter(route, &direct, &flood);
+    #[cfg(feature = "mqtt")]
+    fn mqtt_status_text(&self) -> String {
+        let mut output = String::new();
+        for index in 0..MQTT_SERVER_COUNT {
+            let state = self.mqtt_state(index);
+            let _ = write!(&mut output, "MQTT {}: {}", index + 1, state.as_str());
+            if let Some(error) = self.mqtt_error(index) {
+                let _ = write!(&mut output, " (last error: {})", error.as_str());
+            }
+            output.push('\n');
         }
-        assert_eq!(direct.load(Ordering::Relaxed), 2);
-        assert_eq!(flood.load(Ordering::Relaxed), 0);
-        for route in [RouteType::Flood, RouteType::TransportFlood] {
-            increment_route_counter(route, &direct, &flood);
+        output
+    }
+}
+
+impl mcrs_repeater::Extension for Network {
+    type Config = NetworkConfig;
+
+    #[cfg(feature = "mqtt")]
+    fn observe_packet(
+        &self,
+        direction: mcrs_repeater::radio::Direction,
+        payload: &[u8],
+        rssi: i16,
+        snr_quarters: i16,
+    ) {
+        for channel in &self.mqtt {
+            let _ = channel.try_send(mqtt::PacketEvent::new(
+                direction,
+                payload,
+                rssi,
+                snr_quarters,
+            ));
         }
-        assert_eq!(direct.load(Ordering::Relaxed), 2);
-        assert_eq!(flood.load(Ordering::Relaxed), 2);
     }
 
-    fn queued(eligible_at_ms: u64) -> QueuedTransmit {
-        QueuedTransmit {
-            eligible_at_ms,
-            attempts: 0,
-            packet: Vec::new(),
-            dedup_signature: None,
-            reboot_after_tx: false,
+    async fn handle_command<S>(
+        &self,
+        context: &AppContext<S>,
+        command: &str,
+        request: CliRequest,
+    ) -> Option<String>
+    where
+        S: Storage,
+    {
+        if command == "ota" || command.starts_with("ota ") {
+            return Some(self.handle_ota_command(command, request));
         }
+
+        #[cfg(feature = "mqtt")]
+        if command == "mqtt status" {
+            return Some(if request.is_local() {
+                self.mqtt_status_text()
+            } else {
+                denied_text()
+            });
+        }
+
+        #[cfg(feature = "mqtt")]
+        if command == "mqtt restart" {
+            return Some(if request.is_local() && request.is_passworded() {
+                self.request_mqtt_restart();
+                String::from("OK - MQTT restarting")
+            } else {
+                denied_text()
+            });
+        }
+
+        if let Some(setting) = command.strip_prefix("get ").map(str::trim) {
+            return get_setting(setting, context, request).await;
+        }
+        if let Some(setting) = command.strip_prefix("set ").map(str::trim) {
+            return set_setting(setting, context, request).await;
+        }
+        if let Some(setting) = command.strip_prefix("unset ").map(str::trim) {
+            return unset_setting(setting, context, request).await;
+        }
+        None
     }
 
-    #[test]
-    fn sorted_outbound_channel_orders_and_bounds_all_retained_packets() {
-        let channel = SortedOutboundChannel::new(2);
-        assert!(channel.try_send(queued(200)).is_ok());
-        assert!(channel.try_send(queued(100)).is_ok());
-        assert_eq!(channel.len(), 2);
-        assert_eq!(channel.next().map(|next| next.eligible_at_ms), Some(100));
-        assert!(channel.try_send(queued(50)).is_err());
-
-        let current = channel.take_first().expect("earliest packet");
-        assert_eq!(current.eligible_at_ms, 100);
-        assert_eq!(channel.len(), 2);
-        assert!(channel.try_send(queued(50)).is_err());
-
-        channel.complete_current();
-        assert_eq!(channel.len(), 1);
-        assert!(channel.try_send(queued(50)).is_ok());
-        assert_eq!(channel.next().map(|next| next.eligible_at_ms), Some(50));
+    fn help_commands(&self) -> &'static str {
+        ", ota status"
     }
+
+    fn help_privileged_commands(&self) -> &'static str {
+        ", ota {start|stop}"
+    }
+}
+
+async fn get_setting<S: Storage>(
+    setting: &str,
+    context: &AppContext<S>,
+    request: CliRequest,
+) -> Option<String> {
+    #[cfg(feature = "mqtt")]
+    if let Some((index, key)) = parse_mqtt_key(setting) {
+        if !request.is_local() {
+            return Some(denied_text());
+        }
+        return Some(
+            context
+                .with_config(|config| {
+                    config
+                        .extension()
+                        .mqtt(index)
+                        .and_then(|mqtt| mqtt.value(key))
+                        .map(|value| format!("> {value}"))
+                        .unwrap_or_else(|| format!("Unknown config: {setting}"))
+                })
+                .await,
+        );
+    }
+    if let Some(key) = setting.strip_prefix("wifi.") {
+        if !request.is_local() {
+            return Some(denied_text());
+        }
+        return Some(
+            context
+                .with_config(|config| {
+                    let wifi = config.extension().wifi();
+                    match key {
+                        "ssid" => format!("> {}", wifi.ssid()),
+                        "pass" => format!("> {}", wifi.password()),
+                        "telnet" => format!("> {}", cli::on_off_text(wifi.telnet())),
+                        _ => format!("Unknown config: wifi.{key}"),
+                    }
+                })
+                .await,
+        );
+    }
+    if setting == "ntp" {
+        return Some(
+            context
+                .with_config(|config| format!("> {}", config.extension().ntp()))
+                .await,
+        );
+    }
+    None
+}
+
+async fn set_setting<S: Storage>(
+    setting: &str,
+    context: &AppContext<S>,
+    request: CliRequest,
+) -> Option<String> {
+    let is_ntp = setting == "ntp" || setting.starts_with("ntp ");
+    let is_mqtt = cfg!(feature = "mqtt") && setting.starts_with("mqtt.");
+    if !is_ntp && !is_mqtt && !setting.starts_with("wifi.") {
+        return None;
+    }
+    if !request.is_passworded() {
+        return Some(denied_text());
+    }
+
+    if is_ntp {
+        let host = setting["ntp".len()..].trim();
+        return Some(
+            match context
+                .update_config(|config| config.extension_mut().set_ntp(host))
+                .await
+            {
+                Ok(()) => String::from("OK - applies at next NTP sync"),
+                Err(error) => format!("Error: {error}"),
+            },
+        );
+    }
+
+    if !request.is_local() {
+        return Some(denied_text());
+    }
+
+    #[cfg(feature = "mqtt")]
+    if let Some(mqtt_setting) = setting.strip_prefix("mqtt.") {
+        let Some((key, value)) = mqtt_setting.split_once(' ') else {
+            return Some(String::from("Error, missing MQTT value"));
+        };
+        let full_key = format!("mqtt.{}", key.trim());
+        let Some((index, field)) = parse_mqtt_key(&full_key) else {
+            return Some(String::from(
+                "Error, invalid MQTT setting (use mqtt.1 through mqtt.3)",
+            ));
+        };
+        // The command line is trimmed before parsing, so an explicit empty
+        // string is needed to clear credentials or an audience override.
+        let value = match value.trim() {
+            "\"\"" => "",
+            value => value,
+        };
+        return Some(
+            match context
+                .update_config(|config| config.extension_mut().set_mqtt_value(index, field, value))
+                .await
+            {
+                Ok(()) => String::from("OK - run 'mqtt restart' to apply"),
+                Err(error) => format!("Error: {error}"),
+            },
+        );
+    }
+
+    let wifi_setting = setting.strip_prefix("wifi.")?;
+    let (key, value) = match wifi_setting.split_once(' ') {
+        Some((key, value)) => (key.trim(), value.trim()),
+        None if wifi_setting.trim() == "pass" => ("pass", ""),
+        None => return Some(String::from("Error, missing Wi-Fi value")),
+    };
+    let result = match key {
+        "ssid" => {
+            context
+                .update_config(|config| config.extension_mut().set_wifi_ssid(value))
+                .await
+        }
+        "pass" => {
+            context
+                .update_config(|config| config.extension_mut().set_wifi_password(value))
+                .await
+        }
+        "telnet" => {
+            let Some(enabled) = cli::parse_bool(value) else {
+                return Some(String::from("Error, invalid wifi.telnet value"));
+            };
+            context
+                .update_config(|config| {
+                    config.extension_mut().set_wifi_telnet(enabled);
+                    Ok(())
+                })
+                .await
+        }
+        _ => return Some(String::from("Error, unknown Wi-Fi setting")),
+    };
+    Some(match result {
+        Ok(()) => String::from("OK - reboot to apply"),
+        Err(error) => format!("Error: {error}"),
+    })
+}
+
+async fn unset_setting<S: Storage>(
+    setting: &str,
+    context: &AppContext<S>,
+    request: CliRequest,
+) -> Option<String> {
+    let local_only = setting.starts_with("wifi.") || setting.starts_with("mqtt.");
+    if !local_only && setting != "ntp" {
+        return None;
+    }
+    if !request.is_passworded() || (local_only && !request.is_local()) {
+        return Some(denied_text());
+    }
+
+    Some(
+        match context.update_config(|config| config.unset(setting)).await {
+            #[cfg(feature = "mqtt")]
+            Ok(()) if matches!(setting, "mqtt.1" | "mqtt.2" | "mqtt.3") => {
+                context.extension().request_mqtt_restart();
+                String::from("OK - MQTT server reset to defaults; MQTT restarting")
+            }
+            Ok(()) if setting.starts_with("wifi.") => {
+                String::from("OK - reset to default; reboot to apply")
+            }
+            Ok(()) => String::from("OK - reset to default"),
+            Err(ConfigUpdateError::Invalid(ConfigError::UnknownSetting)) => {
+                format!("Unknown config: {}", setting)
+            }
+            Err(error) => format!("Error: {}", error),
+        },
+    )
+}
+
+fn ota_status_text() -> String {
+    let status = crate::platform::ota_status();
+    if !status.available {
+        return String::from("OTA: unavailable");
+    }
+
+    let next = status.next.unwrap_or("unknown");
+    format!(
+        "OTA: selected={} next={} next_size={}",
+        status.selected, next, status.next_size
+    )
 }

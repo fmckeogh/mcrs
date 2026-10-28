@@ -1720,10 +1720,8 @@ dependencies = [
 name = "mcrs-firmware"
 version = "0.1.2"
 dependencies = [
- "aes 0.9.3",
  "base64",
  "critical-section",
- "curve25519-dalek",
  "ed25519-dalek",
  "embassy-executor",
  "embassy-net",
@@ -1743,14 +1741,12 @@ dependencies = [
  "esp-radio",
  "esp-rom-sys",
  "esp-rtos",
- "hmac 0.13.0",
  "littlefs2-rust",
  "lora-phy",
- "mcrs-protocol",
+ "mcrs-repeater",
  "nb 1.1.0",
  "rand_core 0.6.4",
  "sha1 0.11.0",
- "sha2 0.11.0",
  "static_cell",
  "time",
 ]
@@ -1762,6 +1758,22 @@ dependencies = [
  "defmt 1.2.0",
  "ed25519-dalek",
  "hmac 0.13.0",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "mcrs-repeater"
+version = "0.1.0"
+dependencies = [
+ "aes 0.9.3",
+ "critical-section",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "embassy-sync 0.8.0",
+ "embedded-hal-async",
+ "embedded-storage",
+ "hmac 0.13.0",
+ "mcrs-protocol",
  "sha2 0.11.0",
 ]
 
