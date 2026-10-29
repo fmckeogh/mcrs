@@ -34,6 +34,20 @@ reboot
 
 Changes to the radio settings do not take effect until after a reboot.
 
+## Repeater tier
+
+`tier` ranges from 0 (default) to 10. Higher tiers give repeaters with better
+coverage an earlier chance to forward flood traffic. CAD still checks for a busy
+channel before transmitting.
+
+```text
+set tier 8
+```
+
+Changes apply immediately to newly queued packets; `unset tier` restores the image
+default. Tiers 0, 2, 5 and 10 roughly match MeshCore `txdelay` windows of 0.6, 0.5,
+0.35 and 0.1 respectively. Direct traffic is unaffected.
+
 ## Device identity
 
 Each device generates a private key automatically on the first boot and it is stored in the config. This is used to generate the repeater's public key identity. Most of the time this is sufficient to be left as-is, however if you want to reuse the private key from a different firmware or repeater, you can override it manually:
