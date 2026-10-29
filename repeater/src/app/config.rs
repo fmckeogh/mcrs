@@ -59,6 +59,7 @@ pub struct AppConfig {
     flood_advert_interval_hours: u32,
     loop_detection: LoopDetection,
     path_hash_mode: u8,
+    tier: u8,
     duty_cycle_percent: u8,
     #[cfg(feature = "mqtt")]
     mqtt: [MqttConfig; MQTT_SERVER_COUNT],
@@ -149,6 +150,7 @@ impl AppConfig {
             flood_advert_interval_hours: stored.flood_advert_interval_hours,
             loop_detection: stored.loop_detection,
             path_hash_mode: stored.path_hash_mode,
+            tier: stored.tier,
             duty_cycle_percent: stored.duty_cycle_percent,
             #[cfg(feature = "mqtt")]
             mqtt: stored.mqtt,
@@ -334,6 +336,7 @@ impl AppConfig {
             }
             "loop.detect" => self.loop_detection = defaults.loop_detection,
             "path.hash.mode" => self.path_hash_mode = defaults.path_hash_mode,
+            "tier" => self.tier = defaults.tier,
             _ => return Err(ConfigError::UnknownSetting),
         }
         Ok(())
@@ -385,6 +388,18 @@ impl AppConfig {
 
     pub fn path_hash_mode(&self) -> u8 {
         self.path_hash_mode
+    }
+
+    pub fn tier(&self) -> u8 {
+        self.tier
+    }
+
+    pub fn set_tier(&mut self, tier: u8) -> Result<(), ConfigError> {
+        if tier > 10 {
+            return Err(ConfigError::InvalidTier);
+        }
+        self.tier = tier;
+        Ok(())
     }
 
     pub fn loop_detection(&self) -> LoopDetection {
@@ -647,6 +662,7 @@ fn generated_node_name(private_key: PrivateKey) -> String {
 
 #[derive(Clone)]
 struct StoredAppConfig {
+    tier: u8,
     private_key: PrivateKey,
     latitude_microdegrees: Option<i32>,
     longitude_microdegrees: Option<i32>,
@@ -685,6 +701,7 @@ impl StoredAppConfig {
         // Only device-specific values are generated here. Fixed defaults live
         // in profiles/defaults.conf; the zero values below are parser initialization.
         let empty = Self {
+            tier: 0,
             private_key,
             latitude_microdegrees: None,
             longitude_microdegrees: None,
@@ -725,6 +742,7 @@ impl StoredAppConfig {
 
     fn from_app_config(config: &AppConfig) -> Self {
         Self {
+            tier: config.tier,
             private_key: config.private_key,
             latitude_microdegrees: config.latitude_microdegrees,
             longitude_microdegrees: config.longitude_microdegrees,
@@ -923,6 +941,9 @@ fn decode_config_layer(
             }
             "path.hash.mode" => {
                 config.path_hash_mode = parse_path_hash_mode(&value)?;
+            }
+            "tier" => {
+                config.tier = value.parse::<u8>().ok().filter(|tier| *tier <= 10)?;
             }
             "loop.detect" => {
                 config.loop_detection = LoopDetection::parse(&value)?;
@@ -1169,6 +1190,9 @@ fn encode_sparse_config_text_redacted(
     if config.path_hash_mode != defaults.path_hash_mode {
         let _ = writeln!(&mut out, "path.hash.mode={}", config.path_hash_mode);
     }
+    if config.tier != defaults.tier {
+        let _ = writeln!(&mut out, "tier={}", config.tier);
+    }
     if config.loop_detection != defaults.loop_detection {
         let _ = writeln!(&mut out, "loop.detect={}", config.loop_detection.as_str());
     }
@@ -1296,6 +1320,7 @@ fn encode_full_config_text_redacted(config: &StoredAppConfig, redact_secrets: bo
         config.flood_advert_interval_hours
     );
     let _ = writeln!(&mut out, "path.hash.mode={}", config.path_hash_mode);
+    let _ = writeln!(&mut out, "tier={}", config.tier);
     let _ = writeln!(&mut out, "loop.detect={}", config.loop_detection.as_str());
     #[cfg(feature = "mqtt")]
     for (index, mqtt) in config.mqtt.iter().enumerate() {
@@ -1398,6 +1423,7 @@ pub enum ConfigError {
     InvalidDutyCycle,
     InvalidFloodMaxHops,
     InvalidPathHashMode,
+    InvalidTier,
     InvalidNtpHost,
     InvalidWifiConfig,
     #[cfg(feature = "mqtt")]
@@ -1422,6 +1448,7 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidDutyCycle => f.write_str("invalid duty cycle"),
             ConfigError::InvalidFloodMaxHops => f.write_str("invalid flood max hops"),
             ConfigError::InvalidPathHashMode => f.write_str("invalid path hash mode"),
+            ConfigError::InvalidTier => f.write_str("invalid tier (expected 0..10)"),
             ConfigError::InvalidNtpHost => f.write_str("invalid NTP host"),
             ConfigError::InvalidWifiConfig => f.write_str("invalid Wi-Fi setting"),
             #[cfg(feature = "mqtt")]
@@ -1737,6 +1764,20 @@ mod tests {
 
     fn defaults() -> StoredAppConfig {
         StoredAppConfig::default_with_identity_seed([7; 32])
+    }
+
+    #[test]
+    fn tier_roundtrips_validates_and_unsets() {
+        let mut app = AppConfig::generated_defaults([7; 32]);
+        assert_eq!(app.tier(), 0);
+        for tier in 0..=10 {
+            app.set_tier(tier).unwrap();
+            let encoded = encode_config_text(&StoredAppConfig::from_app_config(&app));
+            assert_eq!(decode_config_text(&encoded, &defaults()).unwrap().tier, tier);
+        }
+        assert!(app.set_tier(11).is_err());
+        assert_eq!(app.tier(), 10);
+        assert!(decode_config_text(b"version=1\ntier=11\n", &defaults()).is_none());
     }
 
     fn network_defaults(text: &str) -> StoredAppConfig {
