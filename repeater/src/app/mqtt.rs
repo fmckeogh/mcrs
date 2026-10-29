@@ -309,13 +309,14 @@ pub fn status_topic(packets: &str) -> String {
         .unwrap_or_else(|| packets.into())
 }
 
-pub fn packet_json(event: &PacketEvent, public_key: &[u8; 32]) -> String {
+pub fn packet_json(event: &PacketEvent, public_key: &[u8; 32], origin: &str) -> String {
     let direction = match event.direction {
         Direction::Rx => "rx",
         Direction::Tx => "tx",
     };
     format!(
-        "{{\"origin_id\":\"{}\",\"type\":\"PACKET\",\"direction\":\"{direction}\",\"raw\":\"{}\",\"RSSI\":{},\"SNR\":{}}}",
+        "{{\"origin\":\"{}\",\"origin_id\":\"{}\",\"type\":\"PACKET\",\"direction\":\"{direction}\",\"raw\":\"{}\",\"RSSI\":{},\"SNR\":{}}}",
+        escape_json(origin),
         hex(public_key),
         hex(&event.payload),
         event.rssi,
@@ -689,9 +690,9 @@ mod tests {
         for (direction, label) in [(Direction::Rx, "rx"), (Direction::Tx, "tx")] {
             let event = PacketEvent::new(direction, &[0x12, 0xab, 0xff], -93, 16);
             assert_eq!(
-                packet_json(&event, &public_key),
+                packet_json(&event, &public_key, "Repeater \"北\"\n\\"),
                 format!(
-                    "{{\"origin_id\":\"{key}\",\"type\":\"PACKET\",\"direction\":\"{label}\",\"raw\":\"12ABFF\",\"RSSI\":-93,\"SNR\":4.00}}"
+                    "{{\"origin\":\"Repeater \\\"北\\\"\\u000a\\\\\",\"origin_id\":\"{key}\",\"type\":\"PACKET\",\"direction\":\"{label}\",\"raw\":\"12ABFF\",\"RSSI\":-93,\"SNR\":4.00}}"
                 )
             );
         }
@@ -804,7 +805,7 @@ mod tests {
     fn mqtt_snr_is_decimal_db_not_the_internal_quarter_db_value() {
         for (quarters, db) in [(33, "8.25"), (-33, "-8.25"), (-1, "-0.25"), (0, "0.00")] {
             let event = PacketEvent::new(Direction::Rx, &[0], -93, quarters);
-            let json = packet_json(&event, &[0; 32]);
+            let json = packet_json(&event, &[0; 32], "Repeater");
             assert!(
                 json.ends_with(&format!("\"RSSI\":-93,\"SNR\":{db}}}")),
                 "{json}"
@@ -846,12 +847,13 @@ mod tests {
         // Exercise multi-byte Remaining Length and a packet larger than TCP's
         // 512-byte send buffer, using the same encoder as the firmware loop.
         let event = PacketEvent::new(Direction::Rx, &[0xab; 255], -90, 7);
-        let json = packet_json(&event, &key);
+        let json = packet_json(&event, &key, "Repeater");
         let publish = publish_packet(&topic, &json, false);
         assert!(publish.len() > 512);
         assert_eq!(publish_contents(&publish), (topic.as_str(), json.as_str()));
         let identity = format!("\"origin_id\":\"{}\"", "CD".repeat(32));
         assert!(json.contains(&identity));
+        assert!(json.contains("\"origin\":\"Repeater\""));
         let status = status_topic(&topic);
         for online in [false, true] {
             let json = status_json(
