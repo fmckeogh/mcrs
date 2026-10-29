@@ -230,9 +230,8 @@ cargo +nightly fuzz run protocol_payloads
 
 The firmware has some opinionated defaults when compared to the official repeater firmware:
 
-* Flood adverts are not sent automatically and cannot be configured to do so. Flooded adverts
-  are extremely wasteful and take up a lot of airtime across long distances, so should be 
-  avoided wherever possible. 
+* Flood adverts are not sent automatically by default. Flooded adverts are extremely wasteful
+  and take up a lot of airtime across long distances, so should be avoided wherever possible. 
 * Zero-hop adverts are sent every 4 hours to populate neighbour lists, this is not currently
   configurable. It is useful to know about repeaters nearby and to be able to see neighbours
   in repeater telemetry, but we avoid sending information about them too often.
