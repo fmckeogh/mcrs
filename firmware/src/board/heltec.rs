@@ -983,16 +983,15 @@ async fn mqtt_connected<R: embedded_io_async::Read, W: embedded_io_async::Write>
                     return transport::write(&mut writer, websocket, 10, &data, rng.bytes()).await;
                 }
                 if let Some(event) = packet {
-                    let payload = context
-                        .with_config(|config| {
-                            mqtt::packet_json(&event, &public_key, config.node_name())
-                        })
-                        .await;
                     transport::write(
                         &mut writer,
                         websocket,
                         2,
-                        &mqtt::publish_packet(&topic, &payload, false),
+                        &mqtt::publish_packet(
+                            &topic,
+                            &mqtt::packet_json(&event, &public_key),
+                            false,
+                        ),
                         rng.bytes(),
                     )
                     .await?;
