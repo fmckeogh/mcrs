@@ -1005,7 +1005,6 @@ async fn handle_get_command(
                 .with_config(|config| format!("> {}", config.path_hash_mode()))
                 .await
         }
-        "tier" => context.with_config(|config| format!("> {}", config.tier())).await,
         "loop.detect" => {
             context
                 .with_config(|config| format!("> {}", config.loop_detection().as_str()))
@@ -1361,15 +1360,6 @@ async fn handle_set_command(
             .await
         {
             Ok(()) => format!("OK - path.hash.mode now: {}", mode),
-            Err(error) => format!("Error: {}", error),
-        };
-    }
-    if let Some(value) = config.strip_prefix("tier ").map(str::trim) {
-        let Ok(tier) = value.parse::<u8>() else {
-            return String::from("Error, invalid tier (expected 0..10)");
-        };
-        return match context.update_config(|config| config.set_tier(tier)).await {
-            Ok(()) => format!("OK - tier now: {}", tier),
             Err(error) => format!("Error: {}", error),
         };
     }

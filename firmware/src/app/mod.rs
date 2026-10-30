@@ -1373,6 +1373,7 @@ async fn queue_repeater_packet<S>(
 ) where
     S: crate::platform::storage::Storage,
 {
+    let delay_ms = forwarding_delay_ms(signature, node_hash);
     let Ok(encoded) = packet.encode() else {
         crate::platform::log_fmt(format_args!("Protocol repeater: {} encode failed", action));
         return;
@@ -1387,13 +1388,6 @@ async fn queue_repeater_packet<S>(
     }
 
     let encoded_len = encoded.len();
-    let delay_ms = if packet.route_type.is_flood() {
-        context.with_config(|config| {
-            flood_forwarding_delay_ms(signature, node_hash, config.radio().packet_airtime_ms(encoded_len), config.tier())
-        }).await
-    } else {
-        forwarding_delay_ms(signature, node_hash)
-    };
     match context.enqueue_forward(encoded, delay_ms, signature) {
         Ok(true) => {}
         Ok(false) => {
@@ -1591,12 +1585,6 @@ fn forwarding_delay_ms(signature: [u8; 8], node_hash: &[u8]) -> u32 {
     FORWARD_DELAY_BASE_MS + (forwarding_jitter_seed(signature, node_hash) % FORWARD_DELAY_JITTER_MS)
 }
 
-fn flood_forwarding_delay_ms(signature: [u8; 8], node_hash: &[u8], airtime_ms: u32, tier: u8) -> u32 {
-    let window_ms = (u64::from(airtime_ms) * u64::from(12 - tier.min(10)) / 4)
-        .min(u64::from(u32::MAX - 1)) as u32;
-    forwarding_jitter_seed(signature, node_hash) % (window_ms + 1)
-}
-
 fn forwarding_jitter_seed(signature: [u8; 8], node_hash: &[u8]) -> u32 {
     let mut seed = 0x811c_9dc5u32;
     for byte in signature.iter().chain(node_hash.iter()) {
@@ -1745,16 +1733,6 @@ mod tests {
             dedup_signature: None,
             reboot_after_tx: false,
         }
-    }
-
-    #[test]
-    fn flood_windows_are_bounded_and_node_specific() {
-        for tier in 0..=10 {
-            for node in 0..100u8 {
-                assert!(flood_forwarding_delay_ms([7; 8], &[node], 400, tier) <= 400 * (12 - u32::from(tier)) / 4);
-            }
-        }
-        assert_ne!(flood_forwarding_delay_ms([7; 8], &[1], 400, 0), flood_forwarding_delay_ms([7; 8], &[2], 400, 0));
     }
 
     #[test]
