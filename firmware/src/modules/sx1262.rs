@@ -8,7 +8,7 @@ use lora_phy::{
     },
     sx126x::{Config, Sx126x, Sx1262, TcxoCtrlVoltage},
 };
-use mcrs_firmware::radio_metrics::PacketMetrics;
+use mcrs_firmware::radio_metrics::{PacketStatus, StatusSpi};
 
 pub const ENABLE_PUBLIC_NETWORK: bool = false;
 pub const RECEIVE_PREAMBLE_LENGTH: u16 = 8;
@@ -63,7 +63,8 @@ where
     WAIT: Wait,
     DLY: DelayNs,
 {
-    radio: Radio<SPI, CTRL, WAIT, DLY>,
+    radio: Radio<StatusSpi<SPI>, CTRL, WAIT, DLY>,
+    packet_status: PacketStatus,
     modulation_params: ModulationParams,
     rx_packet_params: PacketParams,
     tx_packet_params: PacketParams,
@@ -114,6 +115,8 @@ where
     WAIT: Wait,
     DLY: DelayNs,
 {
+    let packet_status = PacketStatus::default();
+    let spi = StatusSpi::new(spi, packet_status.clone());
     let mut radio = init(spi, reset, dio1, busy, delay, board).await?;
     let modulation_params = radio.create_modulation_params(
         receive.spreading_factor,
@@ -139,6 +142,7 @@ where
 
     Ok(Receiver {
         radio,
+        packet_status,
         modulation_params,
         rx_packet_params,
         tx_packet_params,
@@ -168,21 +172,16 @@ where
                 crate::platform::log_radio_receive_error("prepare", radio_error_name(&error));
             })?;
 
-        let (len, status) = loop {
-            match self.radio.rx(&self.rx_packet_params, buffer).await {
-                Ok(packet) => break packet,
-                Err(error @ (RadioError::CrcError | RadioError::HeaderError)) => {
-                    // Returning Err(()) triggers the app's one-second radio-failure
-                    // backoff. Discard corrupt packets and immediately retry instead.
-                    crate::platform::log_radio_receive_error("rx", radio_error_name(&error));
-                }
-                Err(error) => {
-                    crate::platform::log_radio_receive_error("rx", radio_error_name(&error));
-                    return Err(());
-                }
-            }
-        };
-        let status = PacketMetrics::from(status);
+        self.packet_status.take();
+        let (len, _rounded_status) = self
+            .radio
+            .rx(&self.rx_packet_params, buffer)
+            .await
+            .map_err(|error| {
+                crate::platform::log_radio_receive_error("rx", radio_error_name(&error));
+            })?;
+
+        let status = self.packet_status.take().ok_or(())?;
         Ok(crate::modules::ReceivedPacket {
             len: len as usize,
             rssi: status.rssi_dbm,
@@ -235,10 +234,6 @@ fn radio_error_name(error: &RadioError) -> &'static str {
         RadioError::Irq => "irq",
         RadioError::DIO1 => "dio1",
         RadioError::InvalidConfiguration => "invalid-configuration",
-        RadioError::InvalidSyncWord => "invalid-sync-word",
-        RadioError::CrcError => "crc-error",
-        RadioError::HeaderError => "header-error",
-        RadioError::TimedSingleRxUnsupported => "timed-single-rx-unsupported",
         RadioError::InvalidRadioMode => "invalid-radio-mode",
         RadioError::OpError(_) => "op-error",
         RadioError::InvalidBaseAddress(_, _) => "invalid-base-address",

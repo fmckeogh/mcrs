@@ -1,5 +1,7 @@
 //! Signal units at the SX126x boundary: RSSI in dBm, SNR in quarter-dB.
-use core::fmt;
+use alloc::rc::Rc;
+use core::{cell::Cell, fmt};
+use embedded_hal_async::spi::{ErrorType, Operation, SpiDevice};
 
 /// Format quarter-dB as a decimal dB value without floating point or allocation.
 pub struct SnrDb(pub i16);
@@ -18,14 +20,65 @@ pub struct PacketMetrics {
     pub rssi_dbm: i16,
     pub snr_quarters: i16,
 }
-impl From<lora_phy::mod_params::PacketStatus> for PacketMetrics {
-    fn from(status: lora_phy::mod_params::PacketStatus) -> Self {
+impl PacketMetrics {
+    fn from_status(status: &[u8]) -> Self {
         Self {
-            // Match MeshCore's integer cast: truncate toward zero, rather
-            // than the driver's dbm() accessor which rounds down.
-            rssi_dbm: status.rssi.quarter_dbm() / 4,
-            snr_quarters: status.snr.quarter_db(),
+            // Match RadioLib's -raw/2.0 followed by MeshCore's integer cast:
+            // truncate toward zero rather than rounding negative values down.
+            rssi_dbm: -(i16::from(status[0])) / 2,
+            snr_quarters: i16::from(status[1] as i8),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct PacketStatus(Rc<Cell<Option<PacketMetrics>>>);
+impl PacketStatus {
+    pub fn take(&self) -> Option<PacketMetrics> {
+        self.0.take()
+    }
+}
+
+/// Preserve GetPacketStatus's raw values before lora-phy 3.0.1 rounds them to
+/// whole dB. This observes the existing read, without another SPI transaction
+/// (which could pick up a different packet in continuous RX mode), and leaves
+/// the driver's response untouched. The transaction shape is covered by tests.
+pub struct StatusSpi<SPI> {
+    inner: SPI,
+    status: PacketStatus,
+}
+impl<SPI> StatusSpi<SPI> {
+    pub fn new(inner: SPI, status: PacketStatus) -> Self {
+        Self { inner, status }
+    }
+}
+impl<SPI: ErrorType> ErrorType for StatusSpi<SPI> {
+    type Error = SPI::Error;
+}
+impl<SPI: SpiDevice<u8>> SpiDevice<u8> for StatusSpi<SPI> {
+    async fn transaction(
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    ) -> Result<(), Self::Error> {
+        let packet_status =
+            matches!(operations.first(), Some(Operation::Write(command)) if *command == [0x14]);
+        if packet_status {
+            self.status.take();
+        }
+        self.inner.transaction(operations).await?;
+        if packet_status {
+            if let [
+                Operation::Write(_),
+                Operation::Read(status),
+                Operation::Read(data),
+            ] = operations
+            {
+                if status.len() == 1 && data.len() == 3 {
+                    self.status.0.set(Some(PacketMetrics::from_status(data)));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -33,7 +86,6 @@ impl From<lora_phy::mod_params::PacketStatus> for PacketMetrics {
 mod tests {
     use super::*;
     use alloc::format;
-    use embedded_hal_async::spi::{ErrorType, Operation, SpiDevice};
 
     use core::{
         future::Future,
@@ -58,6 +110,7 @@ mod tests {
     }
     struct MockSpi {
         raw: [u8; 3],
+        fail: bool,
     }
     impl ErrorType for MockSpi {
         type Error = embedded_hal::spi::ErrorKind;
@@ -78,6 +131,9 @@ mod tests {
                 }
             })
             .await;
+            if self.fail {
+                return Err(embedded_hal::spi::ErrorKind::Other);
+            }
             let [
                 Operation::Write(command),
                 Operation::Read(status),
@@ -117,71 +173,19 @@ mod tests {
         }
     }
 
-    struct IrqSpi(u16);
-    impl ErrorType for IrqSpi {
-        type Error = embedded_hal::spi::ErrorKind;
-    }
-    impl SpiDevice for IrqSpi {
-        async fn transaction(
-            &mut self,
-            operations: &mut [Operation<'_, u8>],
-        ) -> Result<(), Self::Error> {
-            match operations {
-                [
-                    Operation::Write(command),
-                    Operation::Read(status),
-                    Operation::Read(data),
-                ] => {
-                    assert_eq!(*command, [0x12]); // GetIrqStatus
-                    status.copy_from_slice(&[0x24]);
-                    data.copy_from_slice(&self.0.to_be_bytes());
-                }
-                [Operation::Write(command)] => {
-                    assert_eq!(*command, [0x02, 0xff, 0xff]); // ClearIrqStatus
-                }
-                _ => panic!("unexpected IRQ transaction"),
-            }
-            Ok(())
-        }
-    }
-
     #[test]
-    fn pinned_driver_rejects_crc_and_header_errors_before_rx_done() {
-        use lora_phy::{RxMode, mod_params::RadioMode, mod_traits::IrqState};
-
-        for (flags, expected_error) in [
-            (0x0002, None),
-            (0x0042, Some(RadioError::CrcError)),
-            (0x0020, Some(RadioError::HeaderError)),
-            (0x0022, Some(RadioError::HeaderError)),
-            (0x0062, Some(RadioError::HeaderError)),
-        ] {
-            let mut driver = Sx126x::new(
-                IrqSpi(flags),
-                MockInterface,
-                Config {
-                    chip: Sx1262,
-                    tcxo_ctrl: None,
-                    use_dcdc: true,
-                    rx_boost: true,
-                },
-            );
-            let result =
-                run(driver.process_irq_event(RadioMode::Receive(RxMode::Continuous), None, true));
-            match expected_error {
-                Some(expected) => assert!(matches!(result, Err(error) if error == expected)),
-                None => assert!(matches!(result, Ok(Some(IrqState::Done)))),
-            }
-        }
-    }
-
-    #[test]
-    fn reads_precise_metrics_from_the_pinned_driver() {
-        for (raw_snr, quarters) in [(33, 33), (223, -33), (255, -1)] {
-            let mut driver = Sx126x::new(
+    fn captures_the_actual_lora_phy_status_read_before_rounding() {
+        for (raw_snr, quarters, rounded_snr) in [(33, 33, 8), (223, -33, -8), (255, -1, 0)] {
+            let captured = PacketStatus::default();
+            let spi = StatusSpi::new(
                 MockSpi {
                     raw: [187, raw_snr, 200],
+                    fail: false,
                 },
+                captured.clone(),
+            );
+            let mut driver = Sx126x::new(
+                spi,
                 MockInterface,
                 Config {
                     chip: Sx1262,
@@ -190,23 +194,47 @@ mod tests {
                     rx_boost: true,
                 },
             );
-            let status = run(driver.get_rx_packet_status()).unwrap();
+            let rounded = run(driver.get_rx_packet_status()).unwrap();
+            // lora-phy sees exactly the original response; our metrics retain
+            // the quarter-dB precision it discards and use MeshCore RSSI rounding.
+            assert_eq!(rounded.snr, rounded_snr);
+            assert_eq!(rounded.rssi, -94);
             assert_eq!(
-                PacketMetrics::from(status),
-                PacketMetrics {
+                captured.take(),
+                Some(PacketMetrics {
                     rssi_dbm: -93,
-                    snr_quarters: quarters,
-                }
+                    snr_quarters: quarters
+                })
             );
+            assert_eq!(captured.take(), None);
         }
     }
 
-    fn metrics(raw: [u8; 3]) -> PacketMetrics {
-        use lora_phy::mod_params::{PacketStatus, Rssi, Snr};
-        PacketMetrics::from(PacketStatus {
-            rssi: Rssi::from_quarter_dbm(-i16::from(raw[0]) * 2),
-            snr: Snr::from_quarter_db(i16::from(raw[1] as i8)),
-        })
+    #[test]
+    fn failed_status_read_does_not_reuse_previous_metrics() {
+        let captured = PacketStatus::default();
+        captured.0.set(Some(PacketMetrics {
+            rssi_dbm: -90,
+            snr_quarters: 32,
+        }));
+        let mut spi = StatusSpi::new(
+            MockSpi {
+                raw: [187, 33, 200],
+                fail: true,
+            },
+            captured.clone(),
+        );
+        let mut status = [0];
+        let mut data = [0; 3];
+        assert!(
+            run(spi.transaction(&mut [
+                Operation::Write(&[0x14]),
+                Operation::Read(&mut status),
+                Operation::Read(&mut data)
+            ]))
+            .is_err()
+        );
+        assert_eq!(captured.take(), None);
     }
 
     #[test]
@@ -222,15 +250,15 @@ mod tests {
             (127, 127),
         ] {
             assert_eq!(
-                metrics([187, raw, 200]),
+                PacketMetrics::from_status(&[187, raw, 200]),
                 PacketMetrics {
                     rssi_dbm: -93,
                     snr_quarters: expected
                 }
             );
         }
-        assert_eq!(metrics([186, 0, 0]).rssi_dbm, -93);
-        assert_eq!(metrics([188, 0, 0]).rssi_dbm, -94);
+        assert_eq!(PacketMetrics::from_status(&[186, 0, 0]).rssi_dbm, -93);
+        assert_eq!(PacketMetrics::from_status(&[188, 0, 0]).rssi_dbm, -94);
     }
 
     #[test]

@@ -83,7 +83,7 @@ esp-println = { version = "0.18.0", default-features = false, optional = true }
 esp-rom-sys = { version = "0.1.5", optional = true }
 esp-radio = { version = "0.18.0", default-features = false, features = ["wifi", "esp-alloc", "unstable"], optional = true }
 hmac = { version = "0.13", default-features = false }
-lora-phy = { git = "https://github.com/lora-rs/lora-rs", rev = "15332dab3b4dd39d809990b712cf3ce1f73b14a9" }
+lora-phy = "3.0.1"
 mcrs-protocol = { path = "../protocol" }
 nb = "1.1.0"
 sha2 = { version = "0.11", default-features = false }
