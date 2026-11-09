@@ -148,11 +148,11 @@ checksum = "211713d2e9fb4793ce4360a712c0764264aff6be48932ccf02ca2a331c0436a9"
 dependencies = [
  "btuuid",
  "defmt 1.2.0",
- "embassy-sync 0.7.2",
+ "embassy-sync 0.8.0",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "futures-intrusive",
- "heapless 0.8.0",
+ "heapless 0.9.3",
 ]
 
 [[package]]
@@ -2005,11 +2005,12 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-io-async 0.7.0",
- "embedded-storage",
+ "embedded-storage-async",
  "embedded-tls",
  "hmac 0.13.0",
  "mcrs-protocol",
  "rand_core 0.6.4",
+ "sequential-storage",
  "sha1",
  "sha2 0.11.1",
  "time",
@@ -2406,6 +2407,15 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "sequential-storage"
+version = "8.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1550e4d0c7a6a54e2d7884309dc6bfe206d2d8884cb5498177fd936cb233616d"
+dependencies = [
+ "embedded-storage-async",
+]
 
 [[package]]
 name = "serde"

@@ -1,5 +1,6 @@
 use super::AppContext;
-use crate::platform::{Platform, Storage};
+use crate::platform::Platform;
+use crate::repeater::Storage;
 use defmt::{error, info};
 use embedded_hal_async::delay::DelayNs;
 

@@ -17,6 +17,7 @@ mod remote;
 pub mod telnet;
 pub(crate) mod ui;
 
+use crate::repeater::Storage;
 use alloc::{string::String, vec::Vec};
 use core::{
     cell::{Cell, RefCell},
@@ -38,7 +39,8 @@ use mcrs_protocol::{HashSize, Packet, Path, PayloadKind, RoutePath, RouteType, S
 
 #[cfg(feature = "mqtt")]
 use crate::app::mqtt::MqttContext;
-use crate::platform::{Platform, Storage};
+
+use crate::{platform::Platform, repeater::KvStore};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoopDetection {
@@ -111,10 +113,10 @@ const BATTERY_MILLIVOLTS_UNKNOWN: u16 = u16::MAX;
 
 type AppMutex<T> = Mutex<CriticalSectionRawMutex, T>;
 
-pub struct AppContext<P, S> {
+pub struct AppContext<P, S: Storage> {
     pub platform: P,
     config: AppMutex<config::AppConfig>,
-    storage: AppMutex<S>,
+    storage: AppMutex<KvStore<S>>,
     memory: crate::memory::MemoryProfile,
     neighbours: AppMutex<neighbours::NeighbourTable>,
     remote_logins: AppMutex<remote::RemoteLoginTable>,
@@ -146,7 +148,7 @@ pub struct AppContext<P, S> {
 }
 
 impl<P: Platform, S: Storage> AppContext<P, S> {
-    pub(crate) fn new(platform: P, config: config::AppConfig, storage: S) -> Self {
+    pub(crate) fn new(platform: P, config: config::AppConfig, storage: KvStore<S>) -> Self {
         let started_at_ms = platform.now_millis();
         let memory = platform.memory_profile();
 
@@ -224,12 +226,13 @@ impl<P: Platform, S: Storage> AppContext<P, S> {
         }
         drop(logins);
         let mut storage = self.storage.lock().await;
-        Ok(config.save(&mut *storage)?)
+        Ok(config.save(&mut *storage).await?)
     }
 
     pub async fn reset_config(&self) -> Result<(), crate::platform::storage::Error> {
-        let mut storage = self.storage.lock().await;
-        config::AppConfig::save_unprovisioned(&mut *storage)
+        // let mut storage = self.storage.lock().await;
+        // config::AppConfig::save_unprovisioned(&mut *storage)
+        todo!()
     }
 
     pub async fn observe_neighbour_packet(

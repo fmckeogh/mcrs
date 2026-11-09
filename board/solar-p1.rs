@@ -66,6 +66,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     Repeater::new(
         platform, NoStorage, radio, NoConsole, NoDisplay, NoButton, NoBattery,
     )
+    .await
     .run()
     .await
 }

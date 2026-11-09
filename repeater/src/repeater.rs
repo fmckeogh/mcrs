@@ -2,7 +2,7 @@
 use crate::{
     app::{self, AppContext, battery, cli, config::AppConfig, periodic, ui},
     memory::MemoryProfile,
-    platform::{Battery, Platform, Radio, StatusDisplay, Storage},
+    platform::{Battery, Platform, Radio, StatusDisplay},
 };
 use alloc::{boxed::Box, string::String};
 use core::{
@@ -13,12 +13,20 @@ use core::{
 use defmt::{error, info};
 use embedded_hal_async::digital::Wait;
 use embedded_io_async::{Read, Write};
+use sequential_storage::{
+    cache::{Cache, Uncached},
+    map::{MapConfig, MapStorage},
+};
+
+pub use embedded_storage_async::nor_flash::NorFlash as Storage;
+
+pub type KvStore<S> = MapStorage<u8, S, Cache<Uncached, Uncached, Uncached, u8>>;
 
 /// The repeater for one board, with the devices it drives.
 pub struct Repeater<PLATFORM, STORAGE, RADIO, CONSOLE, DISPLAY, BUTTON, BATTERY>
 where
     PLATFORM: 'static,
-    STORAGE: 'static,
+    STORAGE: Storage + 'static,
 {
     context: &'static AppContext<PLATFORM, STORAGE>,
     radio: RADIO,
@@ -43,9 +51,9 @@ where
     /// `console` serves the local CLI, and a press of `button` pulls its input
     /// low. For a device the board doesn't have, pass the matching `No*` type
     /// from [`crate::platform`].
-    pub fn new(
+    pub async fn new(
         platform: PLATFORM,
-        mut storage: STORAGE,
+        storage: STORAGE,
         radio: RADIO,
         console: CONSOLE,
         display: DISPLAY,
@@ -54,8 +62,19 @@ where
     ) -> Self {
         log_memory_profile(platform.memory_profile());
 
+        let storage_capacity =
+            u32::try_from(storage.capacity()).expect("Storage capacity >u32::MAX");
+
+        let mut storage = MapStorage::<u8, _, _>::new(
+            storage,
+            MapConfig::try_new(0..storage_capacity).unwrap(),
+            Cache::new_uncached(),
+        );
+
         let defaults = AppConfig::generated_defaults(platform.identity_seed());
-        let config = AppConfig::load_or_create(&mut storage, defaults);
+
+        let config = AppConfig::load_or_create(&mut storage, defaults).await;
+
         log_effective_config(&config);
 
         // The repeater runs until the board reboots, so the context is never

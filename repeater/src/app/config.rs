@@ -3,6 +3,7 @@ use super::{
     identity::{self, Identity, PrivateKey},
     regions::{RegionError, RegionMap},
 };
+use crate::repeater::{KvStore, Storage};
 use alloc::{string::String, vec::Vec};
 use core::fmt::{self, Write};
 
@@ -13,7 +14,9 @@ fn clamp_advert_interval(minutes: u32) -> u32 {
     }
 }
 
-const APP_CONFIG_KEY: &str = "app.conf";
+// "app.conf"
+const APP_CONFIG_KEY: u8 = 0;
+
 const APP_CONFIG_TEXT_VERSION: u8 = 1;
 const APP_CONFIG_MAX_LEN: usize = 4096;
 const MAX_REMOTE_PASSWORD_LEN: usize = 64;
@@ -211,14 +214,14 @@ impl AppConfig {
         )
     }
 
-    pub fn load_or_create<S>(storage: &mut S, defaults: Self) -> Self
+    pub async fn load_or_create<S>(storage: &mut KvStore<S>, defaults: Self) -> Self
     where
-        S: crate::platform::Storage,
+        S: Storage,
     {
         let default_identity_label = defaults.identity_label;
         let default_stored = StoredAppConfig::from_app_config(&defaults);
 
-        let (stored, identity_label) = match load_config_file(storage, &default_stored) {
+        let (stored, identity_label) = match load_config_file(storage, &default_stored).await {
             Some((stored, needs_rewrite)) => {
                 if needs_rewrite {
                     let _ = write_config_file(storage, &stored);
@@ -668,18 +671,27 @@ impl AppConfig {
             .expect("UTF-8 config")
     }
 
-    pub fn save<S>(&self, storage: &mut S) -> Result<(), crate::platform::storage::Error>
+    pub async fn save<S>(
+        &self,
+        storage: &mut KvStore<S>,
+    ) -> Result<(), crate::platform::storage::Error>
     where
-        S: crate::platform::Storage,
+        S: Storage,
     {
-        write_config_file(storage, &StoredAppConfig::from_app_config(self))
+        write_config_file(storage, &StoredAppConfig::from_app_config(self)).await
     }
 
-    pub fn save_unprovisioned<S>(storage: &mut S) -> Result<(), crate::platform::storage::Error>
+    pub async fn save_unprovisioned<S>(
+        storage: &mut KvStore<S>,
+    ) -> Result<(), crate::platform::storage::Error>
     where
-        S: crate::platform::Storage,
+        S: Storage,
     {
-        storage.write_atomic(APP_CONFIG_KEY, UNPROVISIONED_CONFIG_TEXT)
+        let buf = &mut [0u8; 8192];
+        storage
+            .store_item(buf, &APP_CONFIG_KEY, &UNPROVISIONED_CONFIG_TEXT)
+            .await
+            .map_err(|_| crate::platform::storage::Error::Io)
     }
 
     pub fn write_effective_config(&self, out: &mut String) {
@@ -877,34 +889,44 @@ impl StoredAppConfig {
     }
 }
 
-fn load_config_file<S>(
-    storage: &mut S,
+async fn load_config_file<S>(
+    storage: &mut KvStore<S>,
     defaults: &StoredAppConfig,
 ) -> Option<(StoredAppConfig, bool)>
 where
-    S: crate::platform::Storage,
+    S: Storage,
 {
     let mut buffer = [0u8; APP_CONFIG_MAX_LEN];
-    let len = storage.read(APP_CONFIG_KEY, &mut buffer).ok()?;
-    let data = buffer.get(..len)?;
+
+    let data: &[u8] = storage
+        .fetch_item(&mut buffer, &APP_CONFIG_KEY)
+        .await
+        .unwrap()
+        .unwrap();
 
     let config = decode_config_text(data, defaults)?;
     let encoded = encode_config_text(&config);
     Some((config, data != encoded.as_slice()))
 }
 
-fn write_config_file<S>(
-    storage: &mut S,
+async fn write_config_file<S>(
+    storage: &mut KvStore<S>,
     config: &StoredAppConfig,
 ) -> Result<(), crate::platform::storage::Error>
 where
-    S: crate::platform::Storage,
+    S: Storage,
 {
+    let buf = &mut [0u8; 8192];
     let data = encode_config_text(config);
     if data.len() > APP_CONFIG_MAX_LEN {
         return Err(crate::platform::storage::Error::BufferTooSmall);
     }
-    storage.write_atomic(APP_CONFIG_KEY, &data)
+    storage
+        .store_item(buf, &APP_CONFIG_KEY, &data.as_slice())
+        .await
+        .unwrap();
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

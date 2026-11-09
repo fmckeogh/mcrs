@@ -17,11 +17,11 @@ pub struct Layout {
     pub max_file_size: usize,
 }
 
-impl embedded_storage::nor_flash::NorFlashError for Error {
-    fn kind(&self) -> embedded_storage::nor_flash::NorFlashErrorKind {
-        match self {
-            Error::BufferTooSmall => embedded_storage::nor_flash::NorFlashErrorKind::OutOfBounds,
-            _ => embedded_storage::nor_flash::NorFlashErrorKind::Other,
-        }
-    }
-}
+// impl embedded_storage::nor_flash::NorFlashError for Error {
+//     fn kind(&self) -> embedded_storage::nor_flash::NorFlashErrorKind {
+//         match self {
+//             Error::BufferTooSmall => embedded_storage::nor_flash::NorFlashErrorKind::OutOfBounds,
+//             _ => embedded_storage::nor_flash::NorFlashErrorKind::Other,
+//         }
+//     }
+// }

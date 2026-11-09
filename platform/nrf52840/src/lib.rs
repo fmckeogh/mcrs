@@ -2,7 +2,7 @@
 
 //! The repeater platform for an nRF52840. The board chooses the radio.
 use core::cell::{Cell, RefCell};
-use embassy_nrf::{mode::Blocking, pac::POWER, rng::Rng};
+use embassy_nrf::{mode::Blocking, nvmc::Nvmc, pac::POWER, rng::Rng};
 use embassy_time::{Delay, Instant};
 use mcrs_repeater::{
     memory::MemoryProfile,

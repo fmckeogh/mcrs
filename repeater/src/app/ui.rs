@@ -1,7 +1,8 @@
 //! The status screen and the user button. A press wakes the screen, and
 //! holding the button sends a zero-hop advert.
 use super::AppContext;
-use crate::platform::{DisplayStatus, Platform, StatusDisplay, Storage};
+use crate::platform::{DisplayStatus, Platform, StatusDisplay};
+use crate::repeater::Storage;
 use alloc::string::String;
 use core::{
     future::{Future, poll_fn},

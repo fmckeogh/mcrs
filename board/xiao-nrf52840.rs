@@ -4,9 +4,11 @@
 #![no_main]
 
 use defmt_rtt as _;
+use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_nrf::{
     bind_interrupts,
     gpio::{Input, Level, Output, OutputDrive, Pull},
+    nvmc::Nvmc,
     peripherals,
     rng::Rng,
     spim::{self, Spim},
@@ -63,9 +65,12 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     );
     let platform = NrfPlatform::new(MODEL, Rng::new_blocking(p.RNG));
 
+    let storage = BlockingAsync::new(Nvmc::new(p.NVMC));
+
     Repeater::new(
-        platform, NoStorage, radio, NoConsole, NoDisplay, NoButton, NoBattery,
+        platform, storage, radio, NoConsole, NoDisplay, NoButton, NoBattery,
     )
+    .await
     .run()
     .await
 }

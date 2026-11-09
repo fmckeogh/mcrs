@@ -1,10 +1,11 @@
+use crate::repeater::Storage;
 use crate::{
     app::{
         AppContext,
         config::{Bandwidth, CodingRate, RadioConfig, SpreadingFactor},
         crypto::{encode_cli_text_response, encode_login_response},
     },
-    platform::{OtaStatus, Platform, Storage},
+    platform::{OtaStatus, Platform},
 };
 use alloc::{format, string::String, vec, vec::Vec};
 use core::fmt::Write;

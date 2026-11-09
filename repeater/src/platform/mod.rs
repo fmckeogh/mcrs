@@ -20,6 +20,7 @@ use crate::{app::config::RadioConfig, memory::MemoryProfile};
 use core::{convert::Infallible, future::Future, net::SocketAddrV4};
 use embedded_hal_async::{delay::DelayNs, digital::Wait};
 use embedded_io_async::{Read, Write};
+use embedded_storage_async::nor_flash::{self, NorFlash, NorFlashError, ReadNorFlash};
 
 /// The services the whole board provides. The repeater shares the platform
 /// between its tasks.
@@ -77,16 +78,6 @@ pub enum OtaStatus {
     Serving(SocketAddrV4),
     /// Pending reset into bootloader
     PendingBootloader,
-}
-
-/// Keeps small files, such as the configuration, across reboots.
-pub trait Storage {
-    /// Reads the file `key` into `buffer` and returns its length.
-    fn read(&mut self, key: &str, buffer: &mut [u8]) -> Result<usize, storage::Error>;
-
-    /// Replaces the file `key`. A power cut leaves either the old or the new
-    /// contents.
-    fn write_atomic(&mut self, key: &str, data: &[u8]) -> Result<(), storage::Error>;
 }
 
 /// A packet that [`Radio::wait_for_read`] copied into the caller's buffer.
@@ -157,13 +148,42 @@ pub trait Battery {
 /// from its defaults with a new identity on every boot.
 pub struct NoStorage;
 
-impl Storage for NoStorage {
-    fn read(&mut self, _key: &str, _buffer: &mut [u8]) -> Result<usize, storage::Error> {
-        Err(storage::Error::NotAvailable)
+#[derive(Debug)]
+pub struct NoStorageError;
+
+impl NorFlashError for NoStorageError {
+    fn kind(&self) -> nor_flash::NorFlashErrorKind {
+        nor_flash::NorFlashErrorKind::Other
+    }
+}
+
+impl nor_flash::ErrorType for NoStorage {
+    type Error = NoStorageError;
+}
+
+impl ReadNorFlash for NoStorage {
+    const READ_SIZE: usize = 0;
+
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        Err(NoStorageError)
     }
 
-    fn write_atomic(&mut self, _key: &str, _data: &[u8]) -> Result<(), storage::Error> {
-        Err(storage::Error::NotAvailable)
+    fn capacity(&self) -> usize {
+        0
+    }
+}
+
+impl NorFlash for NoStorage {
+    const WRITE_SIZE: usize = 0;
+
+    const ERASE_SIZE: usize = 0;
+
+    async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        Err(NoStorageError)
+    }
+
+    async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        Err(NoStorageError)
     }
 }
 

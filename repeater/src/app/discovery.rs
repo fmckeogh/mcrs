@@ -1,6 +1,7 @@
+use crate::repeater::Storage;
 use crate::{
     app::{AppContext, config::AppConfig},
-    platform::{Platform, Storage},
+    platform::Platform,
 };
 use alloc::{string::String, vec::Vec};
 use defmt::{error, info};
