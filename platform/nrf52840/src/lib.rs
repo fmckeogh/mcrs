@@ -11,8 +11,10 @@ use mcrs_repeater::{
     platform::{OtaStatus, Platform},
 };
 
+mod battery;
 mod littlefs;
 
+pub use battery::{NrfBattery, recover, wait_for_battery};
 pub use littlefs::NrfStorage;
 
 /// The heap the repeater's tables and queues are allocated from.

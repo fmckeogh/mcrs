@@ -1,5 +1,5 @@
 //! MCRS repeater for the SenseCAP Solar Node P1. It has no status screen,
-//! button, console or battery monitor.
+//! button or console.
 #![no_std]
 #![no_main]
 
@@ -10,25 +10,32 @@ use embassy_nrf::{
     nvmc::Nvmc,
     peripherals,
     rng::Rng,
+    saadc,
     spim::{self, Spim},
 };
-use embassy_time::Delay;
+use embassy_time::{Delay, Timer};
 use embedded_alloc::LlffHeap as Heap;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use mcrs_nrf::{HEAP_SIZE, NrfPlatform, NrfStorage};
+use mcrs_nrf::{HEAP_SIZE, NrfBattery, NrfPlatform, NrfStorage, recover, wait_for_battery};
 use mcrs_repeater::{
     Repeater,
-    platform::{NoBattery, NoButton, NoConsole, NoDisplay, Radio},
+    platform::{NoButton, NoConsole, NoDisplay},
 };
 use mcrs_sx1262::{BoardConfig, Sx1262, TcxoCtrlVoltage};
 use panic_probe as _;
 
 const MODEL: &str = "SenseCAP Solar Node P1";
+// Provisional values; validate against this board's battery and regulator.
+const STARTUP_MIN_MV: u16 = 3300;
+const VOLTAGE_WARNING_MV: u16 = 3000;
+// The XIAO nRF52840's own divider, 1 MΩ over 510 kΩ.
+const BATTERY_DIVIDER_SCALE_MILLI: u32 = 2961;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
 bind_interrupts!(struct Irqs {
+    SAADC => saadc::InterruptHandler;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
 });
 
@@ -44,6 +51,14 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let reset = Output::new(p.P0_28, Level::High, OutputDrive::Standard);
     let dio1 = Input::new(p.P0_03, Pull::Down);
     let busy = Input::new(p.P0_29, Pull::None);
+
+    // Low connects the battery divider. It stays low, as in MeshCore and Meshtastic, because
+    // high can put too much voltage on the sense pin. MeshCore gives it 50ms to settle.
+    let _battery_enable = Output::new(p.P0_14, Level::Low, OutputDrive::Standard);
+    Timer::after_millis(50).await;
+    let mut battery = NrfBattery::new(p.SAADC, Irqs, p.P0_31, BATTERY_DIVIDER_SCALE_MILLI);
+    // Before anything that draws much power or writes to the flash.
+    wait_for_battery(&mut battery, STARTUP_MIN_MV).await;
 
     let mut spi_config = spim::Config::default();
     spi_config.frequency = spim::Frequency::M16;
@@ -68,7 +83,6 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let mut console = NoConsole;
     let mut display = NoDisplay;
     let mut button = NoButton;
-    let mut battery = NoBattery;
 
     Repeater::new(
         platform,
@@ -79,9 +93,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         &mut button,
         &mut battery,
     )
-    .run(0) // Battery monitoring disabled.
+    .run(VOLTAGE_WARNING_MV)
     .await;
-    // Brownout has no timer recovery on these boards yet.
-    let _ = radio.shutdown().await;
-    core::future::pending().await
+
+    recover(&mut radio).await
 }
